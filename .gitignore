@@ -21,3 +21,6 @@ config.json
 
 # Claude Code
 .claude/
+
+# Session notes (internal only)
+SESSION-*.md
