@@ -748,6 +748,46 @@ def api_config_defaults():
     })
 
 # ─────────────────────────────────────────────────────────────────────────────
+# API — Runtipi API test
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/api/runtipi/test", methods=["POST"])
+def api_runtipi_test():
+    d    = request.get_json(force=True)
+    user = d.get("tipiUser", "").strip()
+    pw   = d.get("tipiPass", "").strip()
+    if not user or not pw:
+        return jsonify({"ok": False, "error": "Username and password are required"}), 400
+
+    # Resolve container IP via docker inspect
+    ip_out, _, rc = sh("docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' runtipi 2>/dev/null")
+    ip = ip_out.strip().split()[0] if ip_out.strip() else ""
+    if not ip:
+        return jsonify({"ok": False, "error": "runtipi container not found or not running"}), 503
+
+    base_url = f"http://{ip}:3000"
+
+    import json as _json, urllib.request, urllib.error
+    payload = _json.dumps({"username": user, "password": pw}).encode()
+    req = urllib.request.Request(
+        f"{base_url}/api/auth/login",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            body = _json.loads(resp.read())
+            if body.get("success"):
+                return jsonify({"ok": True, "url": base_url, "message": f"Login successful ({base_url})"})
+            return jsonify({"ok": False, "error": f"Unexpected response: {body}"})
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        return jsonify({"ok": False, "error": f"HTTP {e.code}: {body[:200]}"}), 200
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 200
+
+# ─────────────────────────────────────────────────────────────────────────────
 # API — SMB connection test
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1121,7 +1161,7 @@ def api_image_status():
     cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
     mount_point = cfg.get("mountPoint", "/mnt/backups")
     image_name  = cfg.get("imageName",  "pi_backup.img")
-    headroom_mb = int(cfg.get("imageHeadroom", 2000))
+    headroom_mb = int(cfg.get("imageHeadroom", 5000))
     image_path  = f"{mount_point}/{image_name}"
 
     result = {
@@ -2462,14 +2502,17 @@ textarea{resize:vertical;line-height:1.6}
       <div>
         <div class="field"><div class="lbl">Max Log Lines</div><input type="number" id="maxLogLines" value="2000"><div class="hint">Log trimmed on each run</div></div>
         <div class="field"><div class="lbl">Log File Path</div><input type="text" id="logPath" placeholder="~/cron_debug.log"></div>
-        <div class="field"><div class="lbl">Image Headroom (MB)</div><input type="number" id="imageHeadroom" value="2000" min="200" max="10000"><div class="hint">Extra free space reserved in the image beyond current data size. Increase if backups fail with "No space left". Default 2000 MB.</div></div>
+        <div class="field"><div class="lbl">Image Headroom (MB)</div><input type="number" id="imageHeadroom" value="5000" min="500" max="20000"><div class="hint">Space the image must have beyond source data size. Auto-resize triggers if image capacity &lt; source used + headroom. Increase for large app backups (Immich etc). Default 5000 MB.</div></div>
       </div>
       <div>
         <div class="field"><div class="lbl">Lock File Path</div><input type="text" id="lockFile" value="/tmp/weekly_image.lock"><div class="hint">Prevents concurrent runs</div></div>
         <div class="field"><div class="lbl">Runtipi Directory</div><input type="text" id="tipiDir" placeholder="~/runtipi"></div>
-        <div class="field"><div class="lbl">Runtipi URL</div><input type="text" id="tipiApiUrl" placeholder="http://localhost"><div class="hint">Used for API-based app restart fallback</div></div>
         <div class="field"><div class="lbl">Runtipi Username</div><input type="text" id="tipiUser" placeholder="admin"></div>
         <div class="field"><div class="lbl">Runtipi Password</div><input type="password" id="tipiPass" placeholder="(enables API restart fallback)"><div class="hint">Stored in generated script — keep script file permissions tight</div></div>
+        <div class="field" style="flex-direction:row;align-items:center;gap:10px;flex-wrap:wrap">
+          <button class="btn" style="font-size:12px;padding:6px 14px" onclick="testRuntipiApi()">🔗 Test Runtipi API</button>
+          <span id="tipi-test-status" style="font-size:12px;color:var(--muted)"></span>
+        </div>
       </div>
     </div>
   </div>
@@ -3427,6 +3470,28 @@ async function saveCredentials() {
 }
 
 // ─── SMB test ─────────────────────────────────────────────────────────────────
+async function testRuntipiApi() {
+  const el = document.getElementById("tipi-test-status");
+  el.style.color = "var(--muted)";
+  el.textContent = "Testing…";
+  try {
+    const r = await fetch("/api/runtipi/test", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ tipiUser: document.getElementById("tipiUser").value,
+                             tipiPass: document.getElementById("tipiPass").value }) });
+    const d = await r.json();
+    if (d.ok) {
+      el.style.color = "var(--green)";
+      el.textContent = "✓ " + d.message;
+    } else {
+      el.style.color = "var(--red)";
+      el.textContent = "✗ " + d.error;
+    }
+  } catch(e) {
+    el.style.color = "var(--red)";
+    el.textContent = "✗ " + e.message;
+  }
+}
+
 async function smbTest() {
   spin("smb-test-sp", true);
   clearLog("smb-test-log");
@@ -3800,8 +3865,8 @@ function collectConfig() {
     cronMode: S.cronMode, cronDays: S.cronDays, cronExpr: document.getElementById("cron-expr").textContent,
     cronFreq: g("cronFreq"), cronHour: g("cronHour"), cronMin: g("cronMin"), customCron: g("cronCustom"),
     maxLogLines: g("maxLogLines"), logPath: g("logPath"), lockFile: g("lockFile"), tipiDir: g("tipiDir"),
-    tipiApiUrl: g("tipiApiUrl"), tipiUser: g("tipiUser"), tipiPass: g("tipiPass"),
-    imageHeadroom: g("imageHeadroom") || "2000",
+    tipiUser: g("tipiUser"), tipiPass: g("tipiPass"),
+    imageHeadroom: g("imageHeadroom") || "5000",
     containerCfg: S.containerCfg,
   };
 }
@@ -3830,7 +3895,7 @@ async function loadConfig() {
     sv("shutdownMethod", c.shutdownMethod); sv("shutdownFallback", c.shutdownFallback);
     sv("gracePeriod", c.gracePeriod); sv("settleTime", c.settleTime); sv("healthTimeout", c.healthTimeout);
     sv("maxLogLines", c.maxLogLines); sv("logPath", c.logPath); sv("lockFile", c.lockFile); sv("tipiDir", c.tipiDir);
-    sv("tipiApiUrl", c.tipiApiUrl); sv("tipiUser", c.tipiUser); sv("tipiPass", c.tipiPass);
+    sv("tipiUser", c.tipiUser); sv("tipiPass", c.tipiPass);
     sv("imageHeadroom", c.imageHeadroom);
     // toggles
     ["ntfyEnabled","notifySuccess","notifyFailure","notifyStart"].forEach(k => {
@@ -3871,7 +3936,7 @@ function generateScript() {
   const c   = collectConfig();
   const mp  = c.mountPoint || "/mnt/backups";
   const img = c.imageName  || "pi_backup.img";
-  const mb  = c.imageHeadroom || "2000";
+  const mb  = c.imageHeadroom || "5000";
   const containers = S.containers;
   const ccfg       = S.containerCfg;
   const foundations = containers.filter(x => ccfg[x.id]?.priority === "foundation" && ccfg[x.id]?.restartAfter);
@@ -3952,10 +4017,8 @@ LOCK_FILE="${c.lockFile||"/tmp/weekly_image.lock"}"
 CRON_LOG="${c.logPath||S.defaults.logPath}"
 MAX_LOG_LINES=${c.maxLogLines||2000}
 TIPI_HEALTH_TIMEOUT=${c.healthTimeout||120}
-${tipiCreds ? `TIPI_URL="${c.tipiApiUrl||"http://localhost"}"
-TIPI_USER="${c.tipiUser}"
-TIPI_PASS="${c.tipiPass}"` : `TIPI_URL=""
-TIPI_USER=""
+${tipiCreds ? `TIPI_USER="${c.tipiUser}"
+TIPI_PASS="${c.tipiPass}"` : `TIPI_USER=""
 TIPI_PASS=""`}
 ${ntfy ? `NTFY_URL="${c.ntfyServer||"https://ntfy.sh"}/${c.ntfyTopic||"my_backup"}"` : ""}
 
@@ -3988,11 +4051,19 @@ elapsed_time() { local S=$(( $(date +%s) - START_TIME )); printf "%dh %02dm %02d
 
 # ── Runtipi API helpers ────────────────────────────────────────────────────────
 TIPI_LOGGED_IN=0
+_tipi_base_url() {
+  # Resolve the runtipi container IP directly — bypasses Traefik which blocks /api/ paths
+  local ip
+  ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' runtipi 2>/dev/null | awk '{print $1}')
+  [ -n "$ip" ] && echo "http://\${ip}:3000" || echo ""
+}
 runtipi_login() {
   [ -z "$TIPI_USER" ] || [ -z "$TIPI_PASS" ] && return 1
-  local r
+  local url r
+  url=$(_tipi_base_url)
+  [ -z "$url" ] && { echo "$(date): WARNING - cannot resolve Runtipi container IP for API login"; return 1; }
   r=$(curl -sf -c /tmp/_pbm_tipi_cookies \\
-    -X POST "$TIPI_URL/api/auth/login" \\
+    -X POST "$url/api/auth/login" \\
     -H "Content-Type: application/json" \\
     -d "{\"username\":\"$TIPI_USER\",\"password\":\"$TIPI_PASS\"}" 2>&1)
   if [ $? -eq 0 ]; then
@@ -4009,8 +4080,10 @@ runtipi_start_app_by_compose() {
   local app_id
   app_id=$(echo "$compose_file" | sed -n 's|.*/data/apps/[^/]*/\\([^/]*\\)/.*|\\1|p')
   [ -z "$app_id" ] && return 1
-  local urn
-  urn=$(curl -sf -b /tmp/_pbm_tipi_cookies "$TIPI_URL/api/apps/installed" \\
+  local url urn
+  url=$(_tipi_base_url)
+  [ -z "$url" ] && return 1
+  urn=$(curl -sf -b /tmp/_pbm_tipi_cookies "$url/api/apps/installed" \\
     | APP_ID="$app_id" python3 -c "
 import sys, json, os
 app_id = os.environ['APP_ID']
@@ -4024,17 +4097,21 @@ except: pass" 2>/dev/null)
     return 1
   fi
   echo "$(date): Starting '$app_id' via Runtipi API (URN: $urn)..."
-  curl -sf -b /tmp/_pbm_tipi_cookies -X POST "$TIPI_URL/api/app-lifecycle/$urn/start" > /dev/null \\
+  curl -sf -b /tmp/_pbm_tipi_cookies -X POST "$url/api/app-lifecycle/$urn/start" > /dev/null \\
     && echo "$(date): ✓ Started $app_id via Runtipi API" \\
     || { echo "$(date): WARNING - Runtipi API start failed for $app_id"; return 1; }
 }
 
 # smart_start: try docker start → compose up -d → Runtipi API (for /data/apps/ containers)
 smart_start() {
-  local container="$1"
+  local container="$1" err_file
   [ -z "$container" ] && return 0
-  if docker start "$container" 2>/tmp/_pbm_ds_err; then
+  # Skip containers that are already running (e.g. brought up by runtipi-cli start)
+  [ "$(docker inspect -f '{{.State.Status}}' "$container" 2>/dev/null)" = "running" ] && return 0
+  err_file=$(mktemp /tmp/_pbm_ds_err.XXXXXX)
+  if docker start "$container" 2>"$err_file"; then
     echo "$(date): ✓ Started $container"
+    rm -f "$err_file"
     return 0
   fi
   local compose_file
@@ -4063,8 +4140,10 @@ smart_start() {
         echo "$(date): WARNING - compose up -d also failed for $container"
       fi
     fi
+    rm -f "$err_file"
   else
-    echo "$(date): WARNING - could not restart $container: $(cat /tmp/_pbm_ds_err 2>/dev/null | head -2)"
+    echo "$(date): WARNING - could not restart $container: $(head -2 "$err_file" 2>/dev/null)"
+    rm -f "$err_file"
   fi
 }
 
@@ -4090,41 +4169,48 @@ auto_resize_image() {
   local extra_mb="$2"
   [ -f "$img" ] || return 0   # no image yet — fresh run, skip
 
-  echo "$(date): Checking image headroom..."
+  echo "$(date): Checking image capacity..."
   local src_used_mb
   src_used_mb=$(df -BM --output=used / | tail -1 | tr -d 'M ')
 
-  # Attach image to read its free space
+  # Detach any stale loop device already pointing at this image
+  sudo losetup -j "$img" 2>/dev/null | cut -d: -f1 | xargs -r sudo losetup -d 2>/dev/null
+
+  # Attach image to read its total partition capacity
   local loop
   loop=$(sudo losetup -fP --show "$img" 2>/dev/null) || {
     echo "$(date): WARNING - could not attach image for size check, skipping auto-resize"
     return 0
   }
-  local free_mb
-  free_mb=$(sudo df -BM --output=avail "\${loop}p2" 2>/dev/null | tail -1 | tr -d 'M ') || true
+  local image_total_mb
+  image_total_mb=$(sudo df -BM --output=size "\${loop}p2" 2>/dev/null | tail -1 | tr -d 'M ') || true
   sudo losetup -d "$loop" 2>/dev/null
 
-  if [ -z "$free_mb" ]; then
-    echo "$(date): WARNING - could not read image free space, skipping auto-resize"
+  if [ -z "$image_total_mb" ]; then
+    echo "$(date): WARNING - could not read image capacity, skipping auto-resize"
     return 0
   fi
 
-  local threshold_mb=$(( extra_mb / 2 ))
-  echo "$(date): Source used: \${src_used_mb}MB | Image free: \${free_mb}MB | Resize threshold: \${threshold_mb}MB"
+  # Image must hold all source data plus the configured headroom
+  local needed_mb=$(( src_used_mb + extra_mb ))
+  echo "$(date): Source used: \${src_used_mb}MB | Image capacity: \${image_total_mb}MB | Needed: \${needed_mb}MB"
 
-  if [ "$free_mb" -ge "$threshold_mb" ]; then
-    echo "$(date): ✓ Image has sufficient headroom (\${free_mb}MB free)"
+  if [ "$image_total_mb" -ge "$needed_mb" ]; then
+    echo "$(date): ✓ Image has sufficient capacity (\${image_total_mb}MB >= \${needed_mb}MB)"
     return 0
   fi
 
-  # Calculate how much to grow: restore full headroom + 10% safety buffer
-  local grow_mb=$(( extra_mb - free_mb + (extra_mb / 10) ))
-  echo "$(date): ⚠ Image headroom low (\${free_mb}MB < \${threshold_mb}MB) — growing by \${grow_mb}MB..."
+  # Grow to cover the gap plus a 10% safety buffer
+  local grow_mb=$(( needed_mb - image_total_mb + (extra_mb / 10) ))
+  echo "$(date): ⚠ Image too small (\${image_total_mb}MB < \${needed_mb}MB) — growing by \${grow_mb}MB..."
 
   sudo truncate -s "+\${grow_mb}M" "$img" || {
     echo "$(date): ERROR - failed to expand image file (check destination disk space)"
     return 1
   }
+
+  # Detach stale loop again before re-attaching for resize
+  sudo losetup -j "$img" 2>/dev/null | cut -d: -f1 | xargs -r sudo losetup -d 2>/dev/null
 
   local loop2
   loop2=$(sudo losetup -fP --show "$img" 2>/dev/null) || {
@@ -4139,7 +4225,7 @@ auto_resize_image() {
   sudo resize2fs "\${loop2}p2" 2>&1 | sed "s/^/$(date):   /"
   sudo losetup -d "$loop2" 2>/dev/null
 
-  echo "$(date): ✓ Image resized — grew by \${grow_mb}MB. New free space will reflect after next mount."
+  echo "$(date): ✓ Image resized — grew by \${grow_mb}MB. New capacity will reflect after next mount."
   return 0
 }
 
