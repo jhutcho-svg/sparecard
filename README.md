@@ -116,7 +116,7 @@ When Runtipi is configured, the generated script:
    - `docker compose up -d`
    - Runtipi REST API (for app containers that need network recreation, e.g. Immich, qbitgluetun)
 
-Enter your Runtipi URL, username, and password in the **Config** tab to enable the API fallback.
+Enter your Runtipi username and password in the **Config** tab to enable the API fallback. The API URL is auto-detected from the running container — use the **Test Runtipi API** button to verify credentials before generating the script.
 
 ---
 
@@ -132,7 +132,7 @@ Key config options:
 | Backup root | Config tab | Mount point for backup destination |
 | ntfy topic | Config tab | Push notification topic |
 | Runtipi directory | Config tab | Path to runtipi install (default `~/runtipi`) |
-| Runtipi URL/credentials | Config tab | For API-based container restart |
+| Runtipi credentials | Config tab | Username/password for API-based container restart (URL auto-detected) |
 | Cron schedule | Schedule tab | Visual picker or manual cron expression |
 
 ---
@@ -150,6 +150,67 @@ Key config options:
 | Containers | Restore |
 |---|---|
 | ![Containers](screenshots/containers.png) | ![Restore](screenshots/restore.png) |
+
+---
+
+## Changelog
+
+All notable changes are documented here. This is the single source of truth for release history.
+
+---
+
+### 2026-04-12
+
+#### Fixed
+- **Image auto-resize logic rewritten** — previously compared image free space against a threshold, which could still overflow if new data exceeded remaining headroom (e.g. large Immich tarballs). Now correctly compares total image capacity against `source used + headroom`. The `src_used_mb` variable was captured but unused in the resize decision before this fix.
+- **Runtipi API URL blocked by Traefik** — the configured external URL was intercepted by Traefik's `api@internal` router (`PathPrefix('/api')`), causing all API calls to return 404. The generated script now resolves the container IP via `docker inspect` at runtime and calls the API directly on port 3000, bypassing Traefik entirely.
+- **`smart_start` stderr temp file permission error** — `/tmp/_pbm_ds_err` was created root-owned on the first cron run, causing `Permission denied` on all subsequent calls and silencing all container restart error messages. Fixed with `mktemp` per-call temp files.
+- **`smart_start` called on already-running containers** — after `runtipi-cli start` brings containers up, the script no longer falls through to `compose up -d` for containers already running, eliminating noisy log spam.
+- **Stale loop devices in auto-resize** — `auto_resize_image` now detaches any existing loop device pointing at the image file before each `losetup` attach, preventing device accumulation after crashes.
+
+#### Changed
+- Default `IMAGE_HEADROOM_MB` raised from 2000 → **5000 MB** to better accommodate large app backup data (Immich, etc.)
+- Runtipi URL field removed from Config tab — API URL is auto-detected from the container at runtime
+
+#### Added
+- **Test Runtipi API button** in Config tab — resolves container IP and verifies credentials live before script generation
+
+---
+
+### 2026-04-05
+
+#### Added
+- **Dashboard tab** — live overview of last backup result, mount status, image size, cron schedule, and running state
+- **Dashboard ETA + live timer** — when a backup is running, shows started time, estimated finish (based on previous run duration), and a live "Running for" counter
+- **Reset & Cleanup panel** — remove sentinel, lock file, compact temp mount, and image file in one click; uses `sudo rm -f` for root-owned files; select-all checkbox; image target uses `*.img` glob (backend and label)
+- **Mobile responsive layout** — `@media(max-width:640px)` breakpoint across all tabs; scrollable tab bar with hidden scrollbar
+
+#### Fixed
+- Dashboard mount/cron/image fields always showing wrong values — `sh()` stdout/stderr were swapped (`_, out, rc`) in three dashboard calls; fixed to `out, _, rc`
+- Dashboard showing "no data" during a cron-triggered backup — `running` field now also checks whether the lock file is held (`flock -n`), not only the in-memory web UI flag
+- Dashboard showing "running" indefinitely after backup completes — `flock` does not delete the lock file; replaced existence check with `flock -n <file> true` to test if a process actually holds the lock
+- Reset & Cleanup image delete silently succeeding on wrong filename — backend now globs `*.img` and reports how many files were deleted
+
+---
+
+### 2026-03-20
+
+#### Added
+- **Security hardening** — input validation helpers added for all shell-executed parameters: `_valid_mount_path`, `_valid_hostname`, `_valid_share`, `_valid_device`, `_valid_iqn` (RFC 3720), `_valid_port`, `_valid_fstype`, `_valid_script_path`
+- Script read/write restricted to home directory via `Path.resolve()` + `is_relative_to()`
+
+---
+
+### 2026-03-19
+
+#### Added
+- **Runtipi API restart fallback** — third tier in `smart_start`: if `docker start` and `compose up -d` both fail (e.g. Immich/qbitgluetun whose compose files reference external Docker networks by ID that are recreated on Runtipi restart), the script authenticates with the Runtipi REST API and starts the app via `POST /api/app-lifecycle/{urn}/start`. Login performed once per restart cycle, session cookie reused.
+- **"No backup yet" fix after service restart** — `_apply_sentinel_fallback()` in `api_backup_last`: if the log yields no result, checks for `.image_initialised` sentinel and uses image file mtime as the last backup timestamp.
+- **`runtipi-reverse-proxy` left in Created state** — explicit check added to the generated script's restart block: after Runtipi passes health check, `runtipi-reverse-proxy` state is verified and started if not running (known timing issue with `runtipi-cli start`).
+
+#### Fixed
+- **iSCSI block device detection** — replaced `ls -1t /dev/sd*` + string append with `iscsiadm -m session -P 3` to reliably map IQN → block device; login endpoint retries up to 5s for device to appear in sysfs
+- **iSCSI fields blank when session already connected** — `/api/iscsi/sessions` now returns `device` field; destination panel auto-populates IQN and block device and unlocks steps 2 & 3 if an active session exists
 
 ---
 
