@@ -24,3 +24,6 @@ config.json
 
 # Session notes (internal only)
 SESSION-*.md
+
+# Working notes
+rebrand.md

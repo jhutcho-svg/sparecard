@@ -5,7 +5,7 @@ Run with: python3 pi_backup_manager.py
 Then open: http://<pi-ip>:7823
 """
 
-import base64, hashlib, json, os, re, secrets, shlex, subprocess, tempfile, threading, time, queue, calendar
+import base64, hashlib, json, os, re, secrets, shlex, shutil, subprocess, tempfile, threading, time, queue, calendar
 from datetime import datetime
 from pathlib import Path
 from flask import Flask, jsonify, request, Response
@@ -531,7 +531,7 @@ def api_iscsi_discover():
     out, err, rc = sudo(f"iscsiadm -m discovery -t sendtargets -p {portal}:{port} 2>&1", timeout=15)
     if rc != 0:
         if "not found" in err.lower() or "not found" in out.lower():
-            return jsonify({"error": "iscsiadm not found — install: sudo apt install open-iscsi"}), 503
+            return jsonify({"error": "iscsiadm not found — install open-iscsi via the Destination tab"}), 503
         return jsonify({"error": err or out or "Discovery failed"}), 500
     targets = []
     for line in out.splitlines():
@@ -1461,7 +1461,67 @@ def api_cleanup():
 # API — Dependency check & install
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Binary → apt package mapping (only packages we are allowed to install)
+def _detect_pkg_mgr():
+    for mgr in ["apt-get", "pacman", "dnf", "yum", "zypper", "apk", "xbps-install"]:
+        path = shutil.which(mgr)
+        if path:
+            return mgr, path
+    return "apt-get", "/usr/bin/apt-get"
+
+_PKG_MGR, _PKG_BIN = _detect_pkg_mgr()
+
+# Install command args per package manager (binary path + these args + package name)
+_PKG_INSTALL_ARGS = {
+    "apt-get":      ["install", "-y"],
+    "pacman":       ["-S", "--noconfirm", "--needed"],
+    "dnf":          ["install", "-y"],
+    "yum":          ["install", "-y"],
+    "zypper":       ["install", "-y"],
+    "apk":          ["add"],
+    "xbps-install": ["-y"],
+}
+
+# Canonical name (what the frontend sends) → distro-specific package name
+_PKG_NAME_MAP = {
+    "open-iscsi": {
+        "apt-get": "open-iscsi",
+        "pacman":  "open-iscsi",
+        "dnf":     "iscsi-initiator-utils",
+        "yum":     "iscsi-initiator-utils",
+        "zypper":  "open-iscsi",
+        "apk":     "open-iscsi",
+        "xbps-install": "open-iscsi",
+    },
+    "cifs-utils": {
+        "apt-get": "cifs-utils",
+        "pacman":  "cifs-utils",
+        "dnf":     "cifs-utils",
+        "yum":     "cifs-utils",
+        "zypper":  "cifs-utils",
+        "apk":     "cifs-utils",
+        "xbps-install": "cifs-utils",
+    },
+    "smbclient": {
+        "apt-get": "smbclient",
+        "pacman":  "smbclient",
+        "dnf":     "samba-client",
+        "yum":     "samba-client",
+        "zypper":  "samba-client",
+        "apk":     "samba-client",
+        "xbps-install": "samba",
+    },
+    "nfs-common": {
+        "apt-get": "nfs-common",
+        "pacman":  "nfs-utils",
+        "dnf":     "nfs-utils",
+        "yum":     "nfs-utils",
+        "zypper":  "nfs-client",
+        "apk":     "nfs-utils",
+        "xbps-install": "nfs-utils",
+    },
+}
+
+# Binary → canonical package name (frontend uses canonical names)
 _DEP_PKGS = {
     "iscsiadm":   "open-iscsi",
     "mount.cifs": "cifs-utils",
@@ -1469,7 +1529,7 @@ _DEP_PKGS = {
     "showmount":  "nfs-common",
     "mount.nfs":  "nfs-common",
 }
-_ALLOWED_PKGS = set(_DEP_PKGS.values())
+_ALLOWED_PKGS = set(_PKG_NAME_MAP.keys())
 
 _install_queue  = queue.Queue()
 _install_status = {"running": False}
@@ -1485,11 +1545,13 @@ def api_deps_check():
     result["fsck"] = (rc == 0)
     return jsonify(result)
 
-def _run_install_thread(package):
+def _run_install_thread(canonical_pkg):
     global _install_status
     try:
+        distro_pkg = _PKG_NAME_MAP.get(canonical_pkg, {}).get(_PKG_MGR, canonical_pkg)
+        cmd = ["sudo", _PKG_BIN] + _PKG_INSTALL_ARGS.get(_PKG_MGR, ["install", "-y"]) + [distro_pkg]
         proc = subprocess.Popen(
-            ["sudo", "apt-get", "install", "-y", package],
+            cmd,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1
         )

@@ -202,6 +202,36 @@ else
     warn "Then restart the service:     sudo systemctl restart $SERVICE_NAME"
 fi
 
+# ── Write sudoers entry (allows web UI to install optional dependencies) ──────
+step "Writing sudoers entry for dependency installer…"
+SUDOERS_FILE="/etc/sudoers.d/pi-backup-manager"
+case "$PKG_MGR" in
+    apt)    PKG_BIN_PATH="$(command -v apt-get)"; SUDO_ARGS="install -y *" ;;
+    pacman) PKG_BIN_PATH="$(command -v pacman)";  SUDO_ARGS="-S --noconfirm --needed *" ;;
+    dnf)    PKG_BIN_PATH="$(command -v dnf)";     SUDO_ARGS="install -y *" ;;
+    yum)    PKG_BIN_PATH="$(command -v yum)";     SUDO_ARGS="install -y *" ;;
+    zypper) PKG_BIN_PATH="$(command -v zypper)";  SUDO_ARGS="install -y *" ;;
+    apk)    PKG_BIN_PATH="$(command -v apk)";     SUDO_ARGS="add *" ;;
+    xbps)   PKG_BIN_PATH="$(command -v xbps-install)"; SUDO_ARGS="-y *" ;;
+    *)      PKG_BIN_PATH="" ;;
+esac
+
+if [[ -n "$PKG_BIN_PATH" ]]; then
+    sudo tee "$SUDOERS_FILE" > /dev/null <<EOF
+# Pi Backup Manager — allows web UI to install optional dependencies (iSCSI, NFS, SMB)
+$USER ALL=(ALL) NOPASSWD: $PKG_BIN_PATH $SUDO_ARGS
+EOF
+    sudo chmod 440 "$SUDOERS_FILE"
+    if sudo visudo -cf "$SUDOERS_FILE" 2>/dev/null; then
+        info "Sudoers entry written ($PKG_BIN_PATH $SUDO_ARGS)"
+    else
+        warn "Sudoers validation failed — removing. Use the terminal to install dependencies manually."
+        sudo rm -f "$SUDOERS_FILE"
+    fi
+else
+    warn "Could not write sudoers entry — install dependencies manually if the UI install button fails."
+fi
+
 # ── Write systemd unit ────────────────────────────────────────────────────────
 step "Writing systemd service…"
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
