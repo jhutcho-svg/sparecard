@@ -159,6 +159,18 @@ All notable changes are documented here. This is the single source of truth for 
 
 ---
 
+### 2026-05-01
+
+#### Fixed
+- **`install.sh` same-file copy error** — running `bash install.sh` from inside the install directory caused `cp: same file` to abort the install. Now uses an inode check (`-ef`) instead of string comparison, correctly skipping the copy when source and destination are already the same file.
+- **`install.sh` hardcoded to `apt-get`** — Flask, zerofree, and git installs all called `apt-get` directly, breaking on any non-Debian system. Replaced with a `pkg_install` helper that dispatches to the detected package manager.
+- **zerofree install error on Arch/CachyOS** — `zerofree` is not in the official Arch repos (AUR-only), causing `pacman` to error out. The installer now skips the zerofree install on Arch/CachyOS and Alpine/Void (where it is also unavailable) and warns that Compact Image will use the slower fallback method.
+
+#### Added
+- **Multi-distro installer support** — `install.sh` now detects and supports `apt` (Debian/Ubuntu/Pi OS), `pacman` (Arch/CachyOS/Manjaro), `dnf` (Fedora/RHEL 9+), `yum` (RHEL 8/CentOS 7), `zypper` (openSUSE), `apk` (Alpine), and `xbps-install` (Void Linux). Correct package names are used per distro; pip is used as a fallback for Flask if the system package manager fails.
+
+---
+
 ### 2026-04-12
 
 #### Fixed

@@ -25,6 +25,51 @@ command -v python3 >/dev/null || die "python3 not found. Install it with: sudo a
 command -v sudo    >/dev/null || die "sudo not found."
 
 PYTHON="$(command -v python3)"
+PIP="$(command -v pip3 2>/dev/null || command -v pip 2>/dev/null || true)"
+
+# Detect package manager
+if command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR="apt"
+    FLASK_PKG="python3-flask"
+    ZEROFREE_PKG="zerofree"
+    pkg_install() { sudo apt-get install -y -q "$@"; }
+elif command -v pacman >/dev/null 2>&1; then
+    PKG_MGR="pacman"
+    FLASK_PKG="python-flask"
+    ZEROFREE_PKG=""   # AUR-only on Arch/CachyOS, not in official repos
+    pkg_install() { sudo pacman -S --noconfirm --needed "$@"; }
+elif command -v dnf >/dev/null 2>&1; then
+    PKG_MGR="dnf"
+    FLASK_PKG="python3-flask"
+    ZEROFREE_PKG="zerofree"
+    pkg_install() { sudo dnf install -y "$@"; }
+elif command -v yum >/dev/null 2>&1; then
+    PKG_MGR="yum"
+    FLASK_PKG="python3-flask"
+    ZEROFREE_PKG="zerofree"
+    pkg_install() { sudo yum install -y "$@"; }
+elif command -v zypper >/dev/null 2>&1; then
+    PKG_MGR="zypper"
+    FLASK_PKG="python3-Flask"
+    ZEROFREE_PKG="zerofree"
+    pkg_install() { sudo zypper install -y "$@"; }
+elif command -v apk >/dev/null 2>&1; then
+    PKG_MGR="apk"
+    FLASK_PKG="py3-flask"
+    ZEROFREE_PKG=""   # not in Alpine repos
+    pkg_install() { sudo apk add "$@"; }
+elif command -v xbps-install >/dev/null 2>&1; then
+    PKG_MGR="xbps"
+    FLASK_PKG="python3-Flask"
+    ZEROFREE_PKG=""   # not in Void repos
+    pkg_install() { sudo xbps-install -y "$@"; }
+else
+    PKG_MGR="unknown"
+    FLASK_PKG="flask"
+    ZEROFREE_PKG="zerofree"
+    pkg_install() { warn "No supported package manager found. Install manually: $*"; return 1; }
+fi
+info "Package manager: $PKG_MGR"
 
 info "Installing Pi Backup Manager for user: $USER"
 info "Install directory: $INSTALL_DIR"
@@ -38,11 +83,19 @@ mkdir -p "$INSTALL_DIR"
 step "Copying server.py…"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -f "$SCRIPT_DIR/server.py" ]]; then
-    cp "$SCRIPT_DIR/server.py" "$INSTALL_DIR/server.py"
-    info "Copied server.py from $SCRIPT_DIR"
+    if [[ "$SCRIPT_DIR/server.py" -ef "$INSTALL_DIR/server.py" ]]; then
+        info "server.py already in place at $INSTALL_DIR"
+    else
+        cp "$SCRIPT_DIR/server.py" "$INSTALL_DIR/server.py"
+        info "Copied server.py from $SCRIPT_DIR"
+    fi
 elif [[ -f "$PWD/server.py" ]]; then
-    cp "$PWD/server.py" "$INSTALL_DIR/server.py"
-    info "Copied server.py from $PWD"
+    if [[ "$PWD/server.py" -ef "$INSTALL_DIR/server.py" ]]; then
+        info "server.py already in place at $INSTALL_DIR"
+    else
+        cp "$PWD/server.py" "$INSTALL_DIR/server.py"
+        info "Copied server.py from $PWD"
+    fi
 else
     die "server.py not found alongside install.sh or in current directory."
 fi
@@ -56,13 +109,16 @@ info "Syntax OK."
 # ── Install Flask ─────────────────────────────────────────────────────────────
 step "Checking for Flask…"
 if ! "$PYTHON" -c "import flask" 2>/dev/null; then
-    info "Installing Flask via apt (recommended for Raspberry Pi OS)…"
-    sudo apt-get install -y python3-flask -q \
+    info "Installing Flask via $PKG_MGR…"
+    pkg_install "$FLASK_PKG" \
         || {
-            warn "apt install failed — falling back to pip…"
-            pip3 install flask --break-system-packages -q \
-                || pip3 install flask -q \
-                || die "Flask install failed. Try manually: sudo apt install python3-flask"
+            warn "$PKG_MGR install failed — falling back to pip…"
+            if [[ -z "$PIP" ]]; then
+                die "pip not found and package manager install failed. Install Flask manually."
+            fi
+            "$PIP" install flask --break-system-packages -q \
+                || "$PIP" install flask -q \
+                || die "Flask install failed. Install manually: flask via $PKG_MGR or pip."
         }
     info "Flask installed."
 else
@@ -73,9 +129,11 @@ fi
 step "Checking for zerofree…"
 if command -v zerofree >/dev/null 2>&1; then
     info "zerofree already installed."
+elif [[ -z "$ZEROFREE_PKG" ]]; then
+    warn "zerofree is not available for $PKG_MGR — Compact Image will use slower fallback method."
 else
     info "Installing zerofree (used by Compact Image feature)…"
-    sudo apt-get install -y zerofree -q \
+    pkg_install "$ZEROFREE_PKG" \
         || warn "zerofree install failed — Compact Image will use slower fallback method."
 fi
 
@@ -89,7 +147,7 @@ else
     # Ensure git is available
     if ! command -v git >/dev/null 2>&1; then
         info "Installing git…"
-        sudo apt-get install -y git -q || die "Failed to install git."
+        pkg_install git || die "Failed to install git."
     fi
 
     # Clone the repo
