@@ -5,9 +5,11 @@ Run with: python3 pi_backup_manager.py
 Then open: http://<pi-ip>:7823
 """
 
-import base64, hashlib, json, os, re, secrets, shlex, shutil, subprocess, tempfile, threading, time, queue, calendar
+import base64, hashlib, json, logging, os, re, secrets, shlex, shutil, subprocess, tempfile, threading, time, queue, calendar
 from datetime import datetime
+from glob import glob
 from pathlib import Path
+from urllib.parse import urlparse
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
@@ -22,6 +24,68 @@ _auth_failures: dict = {}          # ip -> [timestamp, ...]
 _AUTH_MAX_FAILS   = 10             # max attempts in window
 _AUTH_WINDOW_SECS = 300            # 5-minute window
 _AUTH_LOCKOUT_SECS = 60            # lockout duration after max failures
+_AUTH_MAX_IPS      = 1024          # hard cap on tracked IPs (memory bound)
+
+# Verified-credential cache so PBKDF2 does not run on every request.
+# Basic Auth re-sends the header each request; we cache the *hash* of a
+# verified header for a short TTL and skip the (expensive) KDF on hits.
+_auth_cache: dict = {}             # sha256(header) -> expiry ts
+_AUTH_CACHE_TTL  = 300
+_AUTH_CACHE_MAX  = 512
+
+# Logged once when the server starts handling requests with no auth file.
+_setup_warned = False
+
+def _warn_setup_mode_once():
+    global _setup_warned
+    if not _setup_warned:
+        app.logger.warning(
+            "AUTH_FILE missing - running in OPEN SETUP mode; anyone who can "
+            "reach this server can set the admin credentials.")
+        _setup_warned = True
+
+def _auth_cache_key(hdr):
+    return hashlib.sha256(hdr.encode()).hexdigest()
+
+def _prune_auth_cache(now):
+    for k in [k for k, v in _auth_cache.items() if v <= now]:
+        _auth_cache.pop(k, None)
+    while len(_auth_cache) > _AUTH_CACHE_MAX:
+        _auth_cache.pop(next(iter(_auth_cache)), None)
+
+def _prune_failures(now):
+    """Drop stale/empty IP entries and enforce a hard cap (memory bound)."""
+    for ip in list(_auth_failures.keys()):
+        kept = [t for t in _auth_failures[ip] if now - t < _AUTH_WINDOW_SECS]
+        if kept:
+            _auth_failures[ip] = kept
+        else:
+            del _auth_failures[ip]
+    if len(_auth_failures) > _AUTH_MAX_IPS:
+        victims = sorted(_auth_failures, key=lambda i: _auth_failures[i][-1])
+        for ip in victims[: len(_auth_failures) - _AUTH_MAX_IPS]:
+            del _auth_failures[ip]
+
+def _csrf_ok():
+    """Block cross-site state-changing requests.
+    Safe (read-only) methods and the pre-auth setup endpoints are exempt.
+    Mutations must carry a custom header that cross-origin HTML forms cannot
+    set, and (when present) the Origin must match the request Host."""
+    if request.method in ("GET", "HEAD", "OPTIONS"):
+        return True
+    if request.path in _SETUP_PATHS:
+        return True
+    if request.headers.get("X-PBM-CSRF") != "1":
+        return False
+    origin = request.headers.get("Origin")
+    if origin:
+        try:
+            netloc = urlparse(origin).netloc
+        except Exception:
+            return False
+        if netloc and netloc != request.headers.get("Host", ""):
+            return False
+    return True
 
 def _hash_password(pw, salt=None):
     if salt is None:
@@ -32,10 +96,8 @@ def _hash_password(pw, salt=None):
 def _is_rate_limited(ip: str) -> bool:
     """Return True if this IP has exceeded the failure threshold."""
     now = time.time()
+    _prune_failures(now)
     attempts = _auth_failures.get(ip, [])
-    # Prune old attempts outside the window
-    attempts = [t for t in attempts if now - t < _AUTH_WINDOW_SECS]
-    _auth_failures[ip] = attempts
     if len(attempts) >= _AUTH_MAX_FAILS:
         # Locked out if the most-recent failure is within lockout window
         return (now - attempts[-1]) < _AUTH_LOCKOUT_SECS
@@ -43,10 +105,10 @@ def _is_rate_limited(ip: str) -> bool:
 
 def _record_failure(ip: str):
     now = time.time()
-    attempts = _auth_failures.get(ip, [])
-    attempts = [t for t in attempts if now - t < _AUTH_WINDOW_SECS]
+    attempts = [t for t in _auth_failures.get(ip, []) if now - t < _AUTH_WINDOW_SECS]
     attempts.append(now)
     _auth_failures[ip] = attempts
+    _prune_failures(now)
 
 def _verify_basic(auth_header):
     """Return True if the Authorization header matches stored credentials."""
@@ -74,14 +136,24 @@ _SETUP_PATHS = {"/setup", "/api/auth/setup"}
 def require_auth():
     if not AUTH_FILE.exists():
         # First run — only allow setup routes
+        _warn_setup_mode_once()
         if request.path not in _SETUP_PATHS:
             return Response("", 302, {"Location": "/setup"})
         return
-    # Auth configured — require Basic Auth on all routes
-    if _verify_basic(request.headers.get("Authorization", "")):
-        return
-    return Response("Unauthorized", 401,
-                    {"WWW-Authenticate": 'Basic realm="Pi Backup Manager"'})
+    hdr = request.headers.get("Authorization", "")
+    now = time.time()
+    key = _auth_cache_key(hdr) if hdr else None
+    authed = bool(key and _auth_cache.get(key, 0) > now)
+    if not authed and _verify_basic(hdr):
+        authed = True
+        if key:
+            _auth_cache[key] = now + _AUTH_CACHE_TTL
+            _prune_auth_cache(now)
+    if not authed:
+        return Response("Unauthorized", 401,
+                        {"WWW-Authenticate": 'Basic realm="Pi Backup Manager"'})
+    if not _csrf_ok():
+        return Response("CSRF validation failed", 403)
 
 # ── Auth routes ────────────────────────────────────────────────────────────────
 
@@ -193,6 +265,7 @@ def api_auth_setup():
         return jsonify({"error": "Password must be at least 8 characters."}), 400
     salt, h = _hash_password(password)
     AUTH_FILE.write_text(json.dumps({"username": username, "salt": salt, "hash": h}, indent=2))
+    app.logger.info("Admin credentials created via setup.")
     return jsonify({"ok": True})
 
 @app.route("/api/auth/change", methods=["POST"])
@@ -215,6 +288,8 @@ def api_auth_change():
     creds["salt"] = salt
     creds["hash"] = h
     AUTH_FILE.write_text(json.dumps(creds, indent=2))
+    _auth_cache.clear()  # old Basic header must no longer be accepted
+    app.logger.info("Admin password changed; auth cache cleared.")
     return jsonify({"ok": True})
 
 # ── live backup log queue (for SSE streaming) ─────────────────────────────────
@@ -227,14 +302,53 @@ _backup_log_history = []   # rolling replay buffer for SSE reconnects
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def sh(cmd, timeout=30):
-    r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
-    return r.stdout.strip(), r.stderr.strip(), r.returncode
+def run(argv, timeout=30, merge=False):
+    """Run a command WITHOUT a shell. `argv` is a list, so user-supplied
+    values can never be interpreted as shell syntax (no injection).
+    `merge=True` folds stderr into stdout (replaces shell '2>&1').
+    A missing binary returns rc 127 (mirrors the old shell behaviour) so
+    callers that sniff for 'not found' keep working."""
+    try:
+        r = subprocess.run(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge else subprocess.PIPE,
+            text=True, timeout=timeout,
+        )
+    except FileNotFoundError:
+        return "", f"{argv[0]}: command not found", 127
+    out = (r.stdout or "").strip()
+    err = "" if merge else (r.stderr or "").strip()
+    return out, err, r.returncode
 
-def sudo(cmd, timeout=30):
-    return sh(f"sudo {cmd}", timeout=timeout)
+def sudo_run(argv, timeout=30, merge=False):
+    return run(["sudo", *argv], timeout=timeout, merge=merge)
+
+def _df_line(path):
+    """Last line of `df -h <path>` (the data row), or '' on failure."""
+    out, _, rc = run(["df", "-h", path])
+    if rc != 0 or not out:
+        return ""
+    lines = out.splitlines()
+    return lines[-1] if lines else ""
 
 # ── Input validation helpers ──────────────────────────────────────────────────
+
+def _disk_base(dev):
+    """Normalise a device/partition path to its base *disk* name (no /dev/).
+    Handles sda1->sda, mmcblk0p2->mmcblk0, nvme0n1p3->nvme0n1, loop0p1->loop0."""
+    name = (dev or "").strip()
+    if name.startswith("/dev/"):
+        name = name[len("/dev/"):]
+    m = re.match(r'^(mmcblk\d+|nvme\d+n\d+|loop\d+)(p\d+)?$', name)
+    if m:
+        return m.group(1)
+    return re.sub(r'\d+$', '', name)  # sd/vd/hd/xvd style
+
+def _valid_disk(s):
+    """A whole block *disk* (not a partition) usable as a restore target."""
+    return bool(s and re.match(
+        r'^/dev/(sd[a-z]+|vd[a-z]+|hd[a-z]+|mmcblk\d+|nvme\d+n\d+|loop\d+)$', s))
 
 def _valid_mount_path(path):
     """Absolute path containing only safe characters."""
@@ -279,11 +393,11 @@ def _valid_script_path(path):
         return False
 
 def docker_ok():
-    _, _, rc = sh("docker info 2>/dev/null")
+    _, _, rc = run(["docker", "info"])
     return rc == 0
 
 def is_mounted(path):
-    _, _, rc = sh(f"mountpoint -q {path} 2>/dev/null")
+    _, _, rc = run(["mountpoint", "-q", path])
     return rc == 0
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -292,10 +406,15 @@ def is_mounted(path):
 
 @app.route("/api/system")
 def api_system():
-    model, _, _    = sh("cat /proc/device-tree/model 2>/dev/null | tr -d '\\0' || echo Unknown")
-    hostname, _, _ = sh("hostname")
-    uptime, _, _   = sh("uptime -p 2>/dev/null || uptime")
-    return jsonify({"dockerAvailable": docker_ok(), "model": model.strip(),
+    try:
+        model = Path("/proc/device-tree/model").read_text(errors="ignore").replace("\x00", "").strip() or "Unknown"
+    except Exception:
+        model = "Unknown"
+    hostname, _, _ = run(["hostname"])
+    uptime, _, rc  = run(["uptime", "-p"])
+    if rc != 0 or not uptime:
+        uptime, _, _ = run(["uptime"])
+    return jsonify({"dockerAvailable": docker_ok(), "model": model,
                     "hostname": hostname, "uptime": uptime})
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -307,7 +426,7 @@ def api_containers():
     if not docker_ok():
         return jsonify({"error": "Docker not available"}), 503
     fmt = "{{.ID}}|{{.Names}}|{{.Status}}|{{.Image}}|{{.RunningFor}}|{{.State}}"
-    out, err, rc = sh(f'docker ps -a --format "{fmt}"')
+    out, err, rc = run(["docker", "ps", "-a", "--format", fmt])
     if rc != 0:
         return jsonify({"error": err or "docker ps failed"}), 500
     rows = []
@@ -352,14 +471,15 @@ def api_mount_status():
     mounted = is_mounted(path)
     df = fstype = source = transport = ""
     if mounted:
-        df, _, _ = sh(f"df -h {path} 2>/dev/null | tail -1")
-        mnt, _, _ = sh(f"findmnt -n -o SOURCE,FSTYPE --target {path} 2>/dev/null | head -1")
+        df = _df_line(path)
+        mnt, _, _ = run(["findmnt", "-n", "-o", "SOURCE,FSTYPE", "--target", path])
+        mnt = mnt.splitlines()[0] if mnt else ""
         parts = mnt.split()
         if len(parts) >= 2:
             source, fstype = parts[0], parts[1]
         # Derive base device (e.g. /dev/sdb1 -> sdb) and query transport
-        base = re.sub(r'p?\d+$', '', source.replace('/dev/', ''))
-        tran, _, _ = sh(f"lsblk -d -n -o TRAN /dev/{base} 2>/dev/null")
+        base = _disk_base(source)
+        tran, _, _ = run(["lsblk", "-d", "-n", "-o", "TRAN", f"/dev/{base}"])
         transport = tran.strip().lower()
     return jsonify({"mounted": mounted, "path": path, "df": df,
                     "fstype": fstype, "source": source, "transport": transport})
@@ -374,7 +494,7 @@ def api_mount_do():
         return jsonify({"error": "Invalid mount path"}), 400
 
     if action == "unmount":
-        _, err, rc = sudo(f"umount {path}")
+        _, err, rc = sudo_run(["umount", path])
         return jsonify({"ok": rc == 0, "error": err if rc else ""})
 
     dest = d.get("destType", "local")
@@ -390,13 +510,15 @@ def api_mount_do():
             return jsonify({"error": "Invalid SMB server"}), 400
         if not _valid_share(share):
             return jsonify({"error": "Invalid SMB share"}), 400
+        # user/pw/domain/ver are NOT shell-escaped — they are passed as a
+        # single argv element, so even a password like $(reboot) is inert.
         opts    = f"username={user},password={pw},domain={domain},vers={ver},uid=1000,gid=1000"
         if extra:
             if not re.match(r'^[a-zA-Z0-9=,._\-]+$', extra):
                 return jsonify({"error": "Invalid SMB extra options"}), 400
             opts += "," + extra
-        sudo(f"mkdir -p {path}")
-        _, err, rc = sudo(f'mount -t cifs //{server}/{share} {path} -o "{opts}"', timeout=20)
+        sudo_run(["mkdir", "-p", path])
+        _, err, rc = sudo_run(["mount", "-t", "cifs", f"//{server}/{share}", path, "-o", opts], timeout=20)
     elif dest == "nfs":
         server  = d.get("nfsServer","")
         export  = d.get("nfsExport","")
@@ -410,8 +532,8 @@ def api_mount_do():
             if not re.match(r'^[a-zA-Z0-9=,._\-]+$', custom):
                 return jsonify({"error": "Invalid NFS custom options"}), 400
             opts += "," + custom
-        sudo(f"mkdir -p {path}")
-        _, err, rc = sudo(f"mount -t nfs {server}:{export} {path} -o {opts}", timeout=20)
+        sudo_run(["mkdir", "-p", path])
+        _, err, rc = sudo_run(["mount", "-t", "nfs", f"{server}:{export}", path, "-o", opts], timeout=20)
     elif dest == "usb":
         device = d.get("usbDevice","")
         fstype = d.get("usbFsType","ext4")
@@ -419,14 +541,14 @@ def api_mount_do():
             return jsonify({"error": "Invalid device path"}), 400
         if not _valid_fstype(fstype):
             return jsonify({"error": "Unsupported filesystem type"}), 400
-        sudo(f"mkdir -p {path}")
-        _, err, rc = sudo(f"mount -t {fstype} {device} {path}", timeout=15)
+        sudo_run(["mkdir", "-p", path])
+        _, err, rc = sudo_run(["mount", "-t", fstype, device, path], timeout=15)
     elif dest == "iscsi":
         device = d.get("iscsiDevice","")
         if not _valid_device(device):
             return jsonify({"error": "Invalid device path"}), 400
-        sudo(f"mkdir -p {path}")
-        _, err, rc = sudo(f"mount {device} {path}", timeout=15)
+        sudo_run(["mkdir", "-p", path])
+        _, err, rc = sudo_run(["mount", device, path], timeout=15)
     else:
         # local — just verify
         ok = Path(path).is_dir()
@@ -435,7 +557,7 @@ def api_mount_do():
     if rc != 0:
         return jsonify({"ok": False, "error": err or "Mount failed"}), 500
 
-    df, _, _ = sh(f"df -h {path} 2>/dev/null | tail -1")
+    df = _df_line(path)
     return jsonify({"ok": True, "df": df})
 
 @app.route("/api/mount/fstab", methods=["POST"])
@@ -501,7 +623,7 @@ def api_fstab_remove():
 
 def _iscsi_devices_by_iqn():
     """Parse 'iscsiadm -m session -P 3' to map IQN → block device path."""
-    out, _, rc = sudo("iscsiadm -m session -P 3 2>/dev/null")
+    out, _, rc = sudo_run(["iscsiadm", "-m", "session", "-P", "3"])
     result = {}
     if rc != 0:
         return result
@@ -528,7 +650,7 @@ def api_iscsi_discover():
         return jsonify({"error": "Invalid portal address"}), 400
     if not _valid_port(port):
         return jsonify({"error": "Invalid port"}), 400
-    out, err, rc = sudo(f"iscsiadm -m discovery -t sendtargets -p {portal}:{port} 2>&1", timeout=15)
+    out, err, rc = sudo_run(["iscsiadm", "-m", "discovery", "-t", "sendtargets", "-p", f"{portal}:{port}"], timeout=15, merge=True)
     if rc != 0:
         if "not found" in err.lower() or "not found" in out.lower():
             return jsonify({"error": "iscsiadm not found — install open-iscsi via the Destination tab"}), 503
@@ -552,7 +674,7 @@ def api_iscsi_login():
         return jsonify({"error": "Invalid IQN format"}), 400
     if not _valid_port(port):
         return jsonify({"error": "Invalid port"}), 400
-    out, err, rc = sudo(f"iscsiadm -m node -T {iqn} -p {portal}:{port} --login 2>&1", timeout=20)
+    out, err, rc = sudo_run(["iscsiadm", "-m", "node", "-T", iqn, "-p", f"{portal}:{port}", "--login"], timeout=20, merge=True)
     if rc != 0 and "already" not in out.lower():
         return jsonify({"error": err or out or "Login failed"}), 500
     # Find the block device for this specific IQN via session detail — retry up to 5s
@@ -570,7 +692,7 @@ def api_iscsi_logout():
     iqn = d.get("iqn","").strip()
     if not _valid_iqn(iqn):
         return jsonify({"error": "Invalid IQN format"}), 400
-    out, err, rc = sudo(f"iscsiadm -m node -T {iqn} --logout 2>&1", timeout=15)
+    out, err, rc = sudo_run(["iscsiadm", "-m", "node", "-T", iqn, "--logout"], timeout=15, merge=True)
     return jsonify({"ok": rc == 0, "message": out, "error": err if rc else ""})
 
 @app.route("/api/iscsi/autostart", methods=["POST"])
@@ -581,16 +703,16 @@ def api_iscsi_autostart():
     if not _valid_iqn(iqn):
         return jsonify({"error": "Invalid IQN format"}), 400
     value = "automatic" if enable else "manual"
-    out, err, rc = sudo(f"iscsiadm -m node -T {iqn} --op update -n node.startup -v {value} 2>&1", timeout=10)
+    out, err, rc = sudo_run(["iscsiadm", "-m", "node", "-T", iqn, "--op", "update", "-n", "node.startup", "-v", value], timeout=10, merge=True)
     if rc != 0:
         return jsonify({"ok": False, "error": err or out})
     if enable:
-        sudo("systemctl enable iscsid 2>&1", timeout=10)
+        sudo_run(["systemctl", "enable", "iscsid"], timeout=10, merge=True)
     return jsonify({"ok": True, "message": f"node.startup set to {value}"})
 
 @app.route("/api/iscsi/sessions")
 def api_iscsi_sessions():
-    out, _, rc = sh("iscsiadm -m session 2>/dev/null")
+    out, _, rc = run(["iscsiadm", "-m", "session"])
     sessions = []
     if rc == 0:
         for line in out.splitlines():
@@ -613,7 +735,7 @@ def api_nfs_exports():
     server = d.get("server","").strip()
     if not server or not re.match(r'^[\w.\-]+$', server):
         return jsonify({"error": "Invalid or missing server address"}), 400
-    out, err, rc = sh(f"showmount -e {server} 2>&1", timeout=10)
+    out, err, rc = run(["showmount", "-e", server], timeout=10, merge=True)
     if rc != 0:
         return jsonify({"error": err or out or "showmount failed"}), 500
     lines = [l.strip() for l in out.splitlines() if l.startswith("/")]
@@ -625,7 +747,7 @@ def api_nfs_exports():
 
 @app.route("/api/usb/scan")
 def api_usb_scan():
-    out, err, rc = sh("lsblk -J -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT 2>/dev/null")
+    out, err, rc = run(["lsblk", "-J", "-o", "NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT"])
     if rc != 0:
         return jsonify({"error": err or "lsblk failed"}), 500
     try:
@@ -643,7 +765,7 @@ def api_usb_uuid():
     device = request.args.get("device","").strip()
     if not _valid_device(device):
         return jsonify({"error": "Invalid device path"}), 400
-    out, _, rc = sh(f"blkid -s UUID -o value {device} 2>/dev/null")
+    out, _, rc = run(["blkid", "-s", "UUID", "-o", "value", device])
     uuid = out.strip()
     if rc != 0 or not uuid:
         return jsonify({"uuid": None})
@@ -660,7 +782,7 @@ def api_local_verify():
     ok   = p.is_dir() and os.access(path, os.W_OK)
     df   = ""
     if ok:
-        df, _, _ = sh(f"df -h {path} 2>/dev/null | tail -1")
+        df = _df_line(path)
     return jsonify({"ok": ok, "writable": ok, "df": df,
                     "error": "" if ok else f"{path} not found or not writable"})
 
@@ -670,7 +792,7 @@ def api_local_verify():
 
 @app.route("/api/cron", methods=["GET"])
 def api_cron_get():
-    out, _, _ = sh("crontab -l 2>/dev/null")
+    out, _, _ = run(["crontab", "-l"])
     return jsonify({"crontab": out, "hasEntry": "weekly_image.sh" in out})
 
 @app.route("/api/cron", methods=["POST"])
@@ -681,7 +803,7 @@ def api_cron_post():
     log_path    = d.get("logPath",    str(Path.home() / "cron_debug.log"))
     if not cron_line:
         return jsonify({"error": "No cron line"}), 400
-    existing, _, _ = sh("crontab -l 2>/dev/null")
+    existing, _, _ = run(["crontab", "-l"])
     lines = [l for l in existing.splitlines()
              if "weekly_image.sh" not in l and "Pi Backup Manager" not in l]
     lines += [f"# Pi Backup Manager — {datetime.now().strftime('%Y-%m-%d %H:%M')}",
@@ -692,11 +814,12 @@ def api_cron_post():
 
 @app.route("/api/cron/remove", methods=["POST"])
 def api_cron_remove():
-    existing, _, _ = sh("crontab -l 2>/dev/null")
+    existing, _, _ = run(["crontab", "-l"])
     lines = [l for l in existing.splitlines()
              if "weekly_image.sh" not in l and "Pi Backup Manager" not in l]
-    sh(f'echo {repr(chr(10).join(lines))} | crontab -')
-    return jsonify({"ok": True})
+    new_tab = ("\n".join(lines) + "\n") if lines else "\n"
+    r = subprocess.run(["crontab", "-"], input=new_tab, text=True, capture_output=True)
+    return jsonify({"ok": r.returncode == 0, "error": r.stderr if r.returncode else ""})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API — Script write
@@ -760,7 +883,7 @@ def api_runtipi_test():
         return jsonify({"ok": False, "error": "Username and password are required"}), 400
 
     # Resolve container IP via docker inspect
-    ip_out, _, rc = sh("docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' runtipi 2>/dev/null")
+    ip_out, _, rc = run(["docker", "inspect", "-f", "{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}", "runtipi"])
     ip = ip_out.strip().split()[0] if ip_out.strip() else ""
     if not ip:
         return jsonify({"ok": False, "error": "runtipi container not found or not running"}), 503
@@ -804,7 +927,7 @@ def api_smb_test():
         with tempfile.NamedTemporaryFile(mode='w', suffix='.cred', delete=False) as tf:
             tf.write(f"username={user}\npassword={pw}\n")
             cred_file = tf.name
-        out, err, rc = sh(f"smbclient -L //{server} -A {cred_file} -N 2>&1", timeout=10)
+        out, err, rc = run(["smbclient", "-L", f"//{server}", "-A", cred_file, "-N"], timeout=10, merge=True)
     finally:
         try:
             os.unlink(cred_file)
@@ -831,8 +954,8 @@ def api_smb_credentials():
     )
     if result.returncode != 0:
         return jsonify({"ok": False, "error": result.stderr}), 500
-    sudo("chmod 600 /etc/samba/credentials", timeout=5)
-    sudo("chown root:root /etc/samba/credentials", timeout=5)
+    sudo_run(["chmod", "600", "/etc/samba/credentials"], timeout=5)
+    sudo_run(["chown", "root:root", "/etc/samba/credentials"], timeout=5)
     return jsonify({"ok": True})
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1056,7 +1179,7 @@ def _run_verify_thread(image_path):
             return
 
         emit(f"► Attaching loop device for {image_path} …", "cmd")
-        out, err, rc = sh(f"sudo losetup -fP --show {image_path}", timeout=30)
+        out, err, rc = sudo_run(["losetup", "-fP", "--show", image_path], timeout=30)
         loop_dev = out.strip()
         if rc != 0 or not loop_dev:
             emit(f"losetup failed — {err or out}", "err")
@@ -1092,7 +1215,7 @@ def _run_verify_thread(image_path):
 
         emit("", "info")
         emit(f"► Detaching {loop_dev} …", "cmd")
-        sh(f"sudo losetup -d {loop_dev}", timeout=10)
+        sudo_run(["losetup", "-d", loop_dev], timeout=10)
         loop_dev = None
         emit("Loop device detached.", "ok")
 
@@ -1115,7 +1238,7 @@ def _run_verify_thread(image_path):
         _verify_status = {"running": False, "result": "failed"}
     finally:
         if loop_dev:
-            sh(f"sudo losetup -d {loop_dev}", timeout=10)
+            sudo_run(["losetup", "-d", loop_dev], timeout=10)
 
 @app.route("/api/verify/run", methods=["POST"])
 def api_verify_run():
@@ -1176,14 +1299,14 @@ def api_image_status():
     result["exists"]     = True
     result["logical_mb"] = Path(image_path).stat().st_size // (1024 * 1024)
 
-    out, _, rc = sh(f"du -s --block-size=1 {image_path}")
+    out, _, rc = run(["du", "-s", "--block-size=1", image_path])
     if rc == 0:
         try: result["sparse_mb"] = int(out.split()[0]) // (1024 * 1024)
         except Exception: pass
 
-    out, _, rc = sh("df -BM --output=used / | tail -1")
+    out, _, rc = run(["df", "-BM", "--output=used", "/"])
     if rc == 0:
-        try: result["source_used_mb"] = int(out.strip().rstrip("M"))
+        try: result["source_used_mb"] = int(out.splitlines()[-1].strip().rstrip("M"))
         except Exception: pass
 
     wasted = result["sparse_mb"] - result["source_used_mb"] - headroom_mb
@@ -1209,7 +1332,7 @@ def _run_compact_thread(image_path):
             return
 
         before_bytes = Path(image_path).stat().st_size
-        out, _, _ = sh(f"du -s --block-size=1 {image_path}")
+        out, _, _ = run(["du", "-s", "--block-size=1", image_path])
         try:    before_sparse = int(out.split()[0])
         except: before_sparse = before_bytes
 
@@ -1219,7 +1342,7 @@ def _run_compact_thread(image_path):
         emit("", "info")
 
         emit("► Step 1: Attach loop device …", "cmd")
-        out, err, rc = sh(f"sudo losetup -fP --show {image_path}", timeout=30)
+        out, err, rc = sudo_run(["losetup", "-fP", "--show", image_path], timeout=30)
         loop_dev = out.strip()
         if rc != 0 or not loop_dev:
             emit(f"losetup failed: {err or out}", "err")
@@ -1241,8 +1364,7 @@ def _run_compact_thread(image_path):
         emit(f"  e2fsck exit: {proc.returncode}", "ok" if proc.returncode in (0, 1) else "warn")
         emit("", "info")
 
-        _, _, zf_rc = sh("command -v zerofree")
-        if zf_rc == 0:
+        if shutil.which("zerofree"):
             emit("► Step 3: Zeroing free blocks with zerofree …", "cmd")
             proc = subprocess.Popen(
                 ["sudo", "zerofree", "-v", f"{loop_dev}p2"],
@@ -1255,33 +1377,33 @@ def _run_compact_thread(image_path):
             emit(f"  zerofree exit: {proc.returncode}", "ok" if proc.returncode == 0 else "warn")
         else:
             emit("► Step 3: zerofree not found — using mount + zero-fill method …", "cmd")
-            sh(f"sudo mkdir -p {mnt}")
-            _, err_mnt, rc_mnt = sh(f"sudo mount {loop_dev}p2 {mnt}", timeout=30)
+            sudo_run(["mkdir", "-p", mnt])
+            _, err_mnt, rc_mnt = sudo_run(["mount", f"{loop_dev}p2", mnt], timeout=30)
             if rc_mnt != 0:
                 emit(f"  mount failed ({err_mnt}) — skipping zero-fill, holes may be limited", "warn")
             else:
                 emit("  Writing zeros to free space — this may take several minutes …", "info")
-                sh(f"sudo dd if=/dev/zero of={mnt}/zero.tmp bs=1M 2>/dev/null || true", timeout=3600)
-                sh(f"sudo rm -f {mnt}/zero.tmp")
-                sh(f"sudo umount {mnt}", timeout=30)
+                sudo_run(["dd", "if=/dev/zero", f"of={mnt}/zero.tmp", "bs=1M"], timeout=3600)
+                sudo_run(["rm", "-f", f"{mnt}/zero.tmp"])
+                sudo_run(["umount", mnt], timeout=30)
                 emit("  Zero-fill complete.", "ok")
         emit("", "info")
 
         emit("► Step 4: Detach loop device …", "cmd")
-        sh(f"sudo losetup -d {loop_dev}", timeout=10)
+        sudo_run(["losetup", "-d", loop_dev], timeout=10)
         loop_dev = None
         emit("  Detached.", "ok")
         emit("", "info")
 
         emit("► Step 5: Punch holes (fallocate --dig-holes) …", "cmd")
-        _, err, rc = sh(f"sudo fallocate --dig-holes {image_path}", timeout=120)
+        _, err, rc = sudo_run(["fallocate", "--dig-holes", image_path], timeout=120)
         if rc != 0:
             emit(f"  fallocate warning: {err}", "warn")
         else:
             emit("  Holes punched.", "ok")
 
         after_bytes = Path(image_path).stat().st_size
-        out, _, _ = sh(f"du -s --block-size=1 {image_path}")
+        out, _, _ = run(["du", "-s", "--block-size=1", image_path])
         try:    after_sparse = int(out.split()[0])
         except: after_sparse = after_bytes
 
@@ -1301,8 +1423,9 @@ def _run_compact_thread(image_path):
         _compact_status = {"running": False, "result": "failed"}
     finally:
         if loop_dev:
-            sh(f"sudo losetup -d {loop_dev}", timeout=10)
-        sh(f"sudo umount {mnt} 2>/dev/null; sudo rm -rf {mnt}", timeout=10)
+            sudo_run(["losetup", "-d", loop_dev], timeout=10)
+        sudo_run(["umount", mnt], timeout=10)
+        sudo_run(["rm", "-rf", mnt], timeout=10)
 
 
 @app.route("/api/compact/run", methods=["POST"])
@@ -1361,7 +1484,7 @@ def api_dashboard():
         try:
             st   = image_path.stat()
             logical_mb = st.st_size // (1024 * 1024)
-            out, _, _ = sh(f"du -s --block-size=1M {shlex.quote(str(image_path))}")
+            out, _, _ = run(["du", "-s", "--block-size=1M", str(image_path)])
             sparse_mb  = int(out.split()[0]) if out.strip() else logical_mb
             image_info = {
                 "exists": True,
@@ -1379,13 +1502,13 @@ def api_dashboard():
     # flock only releases on process exit; file persists — test if lock is held
     lock_held = False
     if lock_exists:
-        _, _, _flock_rc = sh(f"flock -n {shlex.quote(lock_file)} true")
+        _, _, _flock_rc = run(["flock", "-n", lock_file, "true"])
         lock_held = (_flock_rc != 0)
 
     # ── Mount status ──────────────────────────────────────────────────────────
     mount_info = {"mounted": False}
     try:
-        out, _, rc = sh(f"findmnt -rn -o TARGET,SOURCE,FSTYPE {shlex.quote(mount_point)}")
+        out, _, rc = run(["findmnt", "-rn", "-o", "TARGET,SOURCE,FSTYPE", mount_point])
         if rc == 0 and out.strip():
             parts = out.strip().split()
             mount_info = {
@@ -1400,7 +1523,7 @@ def api_dashboard():
     cron_info = {"installed": False, "expr": "", "human": ""}
     try:
         script_path = cfg.get("scriptPath", str(Path.home() / "weekly_image.sh"))
-        out, _, rc  = sh("crontab -l 2>/dev/null")
+        out, _, rc  = run(["crontab", "-l"])
         for line in (out or "").splitlines():
             if script_path in line and not line.strip().startswith("#"):
                 parts = line.strip().split()
@@ -1438,13 +1561,14 @@ def api_cleanup():
     results = {}
     if "sentinel" in targets:
         p = str(Path(mount_point) / ".image_initialised")
-        _, _, rc = sh(f"sudo rm -f {shlex.quote(p)}", timeout=10)
+        _, _, rc = sudo_run(["rm", "-f", p], timeout=10)
         results["sentinel"] = "deleted" if rc == 0 else "not found or error"
     if "lock" in targets:
-        _, _, rc = sh(f"sudo rm -f {shlex.quote(lock_file)}", timeout=10)
+        _, _, rc = sudo_run(["rm", "-f", lock_file], timeout=10)
         results["lock"] = "deleted" if rc == 0 else "not found or error"
     if "compact_tmp" in targets:
-        _, _, rc = sh("sudo umount -l /tmp/pbm_compact_mnt 2>/dev/null; sudo rm -rf /tmp/pbm_compact_mnt", timeout=15)
+        sudo_run(["umount", "-l", "/tmp/pbm_compact_mnt"], timeout=15)
+        _, _, rc = sudo_run(["rm", "-rf", "/tmp/pbm_compact_mnt"], timeout=15)
         results["compact_tmp"] = "cleaned" if rc == 0 else "cleaned (best-effort)"
     if "image" in targets:
         mnt = Path(mount_point)
@@ -1452,8 +1576,7 @@ def api_cleanup():
         if not imgs:
             results["image"] = "not found"
         else:
-            paths = " ".join(shlex.quote(str(p)) for p in imgs)
-            _, _, rc = sh(f"sudo rm -f {paths}", timeout=30)
+            _, _, rc = sudo_run(["rm", "-f", *[str(p) for p in imgs]], timeout=30)
             results["image"] = f"deleted {len(imgs)} file(s)" if rc == 0 else "error"
     return jsonify({"ok": True, "results": results})
 
@@ -1538,11 +1661,9 @@ _install_status = {"running": False}
 def api_deps_check():
     result = {}
     for binary in _DEP_PKGS:
-        _, _, rc = sh(f"command -v {binary} 2>/dev/null || which {binary} 2>/dev/null")
-        result[binary] = (rc == 0)
+        result[binary] = shutil.which(binary) is not None
     result["image-backup"] = Path("/usr/local/sbin/image-backup").exists()
-    _, _, rc = sh("command -v fsck 2>/dev/null")
-    result["fsck"] = (rc == 0)
+    result["fsck"] = shutil.which("fsck") is not None
     return jsonify(result)
 
 def _run_install_thread(canonical_pkg):
@@ -1618,10 +1739,9 @@ def _run_imgbak_thread(update=False):
     try:
         # Step 1 — ensure git is available
         emit("► Checking for git…", "cmd")
-        _, _, rc = sh("which git 2>/dev/null")
-        if rc != 0:
+        if shutil.which("git") is None:
             emit("git not found — installing via apt…", "warn")
-            out, err, rc2 = sudo("apt-get install -y git 2>&1", timeout=120)
+            out, err, rc2 = sudo_run(["apt-get", "install", "-y", "git"], timeout=120, merge=True)
             for l in (out + "\n" + err).splitlines():
                 if l.strip(): emit(l, "info")
             if rc2 != 0:
@@ -1634,7 +1754,7 @@ def _run_imgbak_thread(update=False):
         if update and _IMGBAK_REPO.exists():
             emit(f"► Updating existing clone at {_IMGBAK_REPO}…", "cmd")
             emit(f"git -C {_IMGBAK_REPO} pull", "cmd")
-            out, err, rc = sh(f"git -C {_IMGBAK_REPO} pull 2>&1", timeout=120)
+            out, err, rc = run(["git", "-C", str(_IMGBAK_REPO), "pull"], timeout=120, merge=True)
             for l in (out + "\n" + err).splitlines():
                 if l.strip(): emit(l, "info")
             if rc != 0:
@@ -1643,12 +1763,12 @@ def _run_imgbak_thread(update=False):
         else:
             if _IMGBAK_REPO.exists():
                 emit(f"Removing old directory {_IMGBAK_REPO}…", "info")
-                sh(f"rm -rf {_IMGBAK_REPO}")
+                run(["rm", "-rf", str(_IMGBAK_REPO)])
             emit("► Cloning RonR-RPi-image-utils from GitHub…", "cmd")
             emit("git clone https://github.com/seamusdemora/RonR-RPi-image-utils.git", "cmd")
-            out, err, rc = sh(
-                f"git clone https://github.com/seamusdemora/RonR-RPi-image-utils.git {_IMGBAK_REPO} 2>&1",
-                timeout=120)
+            out, err, rc = run(
+                ["git", "clone", "https://github.com/seamusdemora/RonR-RPi-image-utils.git", str(_IMGBAK_REPO)],
+                timeout=120, merge=True)
             for l in (out + "\n" + err).splitlines():
                 if l.strip(): emit(l, "info")
             if rc != 0:
@@ -1658,7 +1778,10 @@ def _run_imgbak_thread(update=False):
         # Step 3 — install binaries
         emit("► Installing image-* utilities to /usr/local/sbin…", "cmd")
         emit(f"sudo install --mode=755 {_IMGBAK_REPO}/image-* /usr/local/sbin", "cmd")
-        out, err, rc = sudo(f"install --mode=755 {_IMGBAK_REPO}/image-* /usr/local/sbin 2>&1", timeout=30)
+        img_bins = sorted(glob(str(_IMGBAK_REPO / "image-*")))
+        if not img_bins:
+            emit("No image-* utilities found in the clone.", "err"); done("failed"); return
+        out, err, rc = sudo_run(["install", "--mode=755", *img_bins, "/usr/local/sbin"], timeout=30, merge=True)
         for l in (out + "\n" + err).splitlines():
             if l.strip(): emit(l, "info")
         if rc != 0:
@@ -1715,9 +1838,9 @@ _restore_status = {"running": False, "result": None}
 @app.route("/api/restore/devices")
 def api_restore_devices():
     """List block devices suitable as restore targets, flagging the boot device."""
-    boot_src, _, _ = sh("findmnt -n -o SOURCE / 2>/dev/null")
-    boot_base = re.sub(r'p?\d+$', '', boot_src.strip().replace('/dev/', ''))
-    out, _, rc = sh("lsblk -J -o NAME,SIZE,TYPE,FSTYPE,LABEL,MODEL,TRAN,HOTPLUG 2>/dev/null")
+    boot_src, _, _ = run(["findmnt", "-n", "-o", "SOURCE", "/"])
+    boot_base = _disk_base(boot_src)
+    out, _, rc = run(["lsblk", "-J", "-o", "NAME,SIZE,TYPE,FSTYPE,LABEL,MODEL,TRAN,HOTPLUG"])
     devices = []
     if rc == 0:
         try:
@@ -1749,15 +1872,16 @@ def api_restore_verify():
     return jsonify({"ok": True, "path": path, "sizeBytes": size_bytes, "sizeGb": size_gb})
 
 def _run_restore_thread(image_path, target_device):
-    global _restore_status
-    _restore_status = {"running": True, "result": None}
+    _restore_status["running"] = True
+    _restore_status["result"]  = None
 
     def emit(msg, level="info"):
         _restore_queue.put({"type": "log", "msg": msg, "level": level})
 
     def done(result):
         _restore_queue.put({"type": "done", "result": result})
-        _restore_status = {"running": False, "result": result}
+        _restore_status["running"] = False
+        _restore_status["result"]  = result
 
     try:
         emit("=" * 60, "info")
@@ -1775,23 +1899,29 @@ def _run_restore_thread(image_path, target_device):
         size_gb = Path(image_path).stat().st_size / (1024**3)
         emit(f"Image: {image_path}  ({size_gb:.2f} GB) ✓", "ok")
 
-        # Safety: refuse to write to boot device
+        # Safety: refuse to write to the boot device. Both sides are reduced
+        # to a normalised base-disk name with the SAME helper, so mmcblk/nvme
+        # naming cannot slip past (the old digit-stripping was bypassable).
         emit("► Safety check: verifying target is not the boot device…", "cmd")
-        boot_src, _, _ = sh("findmnt -n -o SOURCE / 2>/dev/null")
-        boot_base = re.sub(r'p?\d+$', '', boot_src.strip())
-        if target_device.rstrip("0123456789") == boot_base.rstrip("0123456789"):
-            emit(f"ABORTED: {target_device} appears to be the boot device ({boot_base}). Refusing to overwrite.", "err")
+        boot_src, _, _ = run(["findmnt", "-n", "-o", "SOURCE", "/"])
+        boot_base   = _disk_base(boot_src)
+        target_base = _disk_base(target_device)
+        if not target_base:
+            emit(f"ABORTED: could not parse target device {target_device}.", "err")
             done("failed"); return
-        emit("Target is not the boot device ✓", "ok")
+        if target_base == boot_base:
+            emit(f"ABORTED: {target_device} resolves to the boot disk (/dev/{boot_base}). Refusing to overwrite.", "err")
+            done("failed"); return
+        emit(f"Target /dev/{target_base} is not the boot disk (/dev/{boot_base}) ✓", "ok")
 
         # Unmount any partitions on target if mounted
         emit("► Checking for mounted partitions on target…", "cmd")
-        mounts, _, _ = sh(f"lsblk -n -o MOUNTPOINT {target_device} 2>/dev/null")
+        mounts, _, _ = run(["lsblk", "-n", "-o", "MOUNTPOINT", target_device])
         for mp in mounts.splitlines():
             mp = mp.strip()
             if mp:
                 emit(f"Unmounting {mp}…", "warn")
-                sudo(f"umount {mp} 2>&1")
+                sudo_run(["umount", mp], merge=True)
         emit("Target is clear ✓", "ok")
         emit("", "info")
 
@@ -1820,7 +1950,8 @@ def _run_restore_thread(image_path, target_device):
         if proc.returncode == 0:
             emit("", "info")
             emit("► Syncing filesystem buffers…", "cmd")
-            sh("sync")
+            run(["sync"])
+            sync_run = run(["sync"]); _ = sync_run
             emit("✓ Image written and verified successfully!", "ok")
             emit(f"✓ {target_device} is ready — safely remove and use as a standby Pi.", "ok")
             done("success")
@@ -1839,8 +1970,19 @@ def api_restore_run():
     d = request.get_json(force=True)
     image_path    = d.get("imagePath", "").strip()
     target_device = d.get("targetDevice", "").strip()
+    confirm       = d.get("confirmDevice", "").strip()
     if not image_path or not target_device:
         return jsonify({"error": "imagePath and targetDevice required"}), 400
+    if not _valid_disk(target_device):
+        return jsonify({"error": "Target must be a whole block disk, e.g. /dev/sda (not a partition)"}), 400
+    if confirm != target_device:
+        return jsonify({"error": "Confirmation device does not match target. This destructive write was not confirmed."}), 400
+    if not Path(image_path).exists():
+        return jsonify({"error": f"Image not found: {image_path}"}), 404
+    # Reject the boot disk up-front (the thread re-checks again before writing).
+    boot_src, _, _ = run(["findmnt", "-n", "-o", "SOURCE", "/"])
+    if _disk_base(target_device) == _disk_base(boot_src):
+        return jsonify({"error": "Refusing to restore onto the boot disk."}), 400
     while not _restore_queue.empty():
         try: _restore_queue.get_nowait()
         except: pass
@@ -3003,6 +3145,21 @@ textarea{resize:vertical;line-height:1.6}
 <div id="toast"></div>
 
 <script>
+// ─── CSRF: attach a custom header to every same-origin mutating request.
+// Cross-site HTML forms cannot set this header, so this blocks CSRF while
+// the server rejects any /api mutation that lacks it. (SSE/GET are exempt.)
+(function () {
+  const _fetch = window.fetch.bind(window);
+  window.fetch = function (url, opts) {
+    opts = opts || {};
+    const sameOrigin = typeof url === "string" && (url.startsWith("/") || url.startsWith(window.location.origin));
+    if (sameOrigin) {
+      opts.headers = Object.assign({}, opts.headers, { "X-PBM-CSRF": "1" });
+    }
+    return _fetch(url, opts);
+  };
+})();
+
 // ─── State ────────────────────────────────────────────────────────────────────
 const S = {
   destType: "iscsi",
@@ -5470,7 +5627,7 @@ async function startRestore() {
 
   try {
     const r = await fetch("/api/restore/run", { method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({imagePath, targetDevice}) });
+      body: JSON.stringify({imagePath, targetDevice, confirmDevice: targetDevice}) });
     const d = await r.json();
     if (!d.ok) { appendRestoreLog(d.error || "Failed to start", "err"); finishRestore("failed"); return; }
 
@@ -5614,6 +5771,15 @@ def index():
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    import logging as _logging
+    _logging.basicConfig(level=_logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+    # Bind to loopback by default. HTTP Basic Auth + the dev server are not
+    # meant to face a whole LAN; reach it over SSH/Tailscale, or set
+    # PBM_HOST=0.0.0.0 to deliberately expose it.
+    host = os.environ.get("PBM_HOST", "127.0.0.1")
+    exposed = host not in ("127.0.0.1", "localhost", "::1")
+
     print(f"""
   ╔══════════════════════════════════════════╗
   ║       Pi Backup Manager  v1.0            ║
@@ -5621,10 +5787,14 @@ if __name__ == "__main__":
 
   Open in browser:
     http://localhost:{PORT}
-    http://<your-pi-ip>:{PORT}
+    {"http://<your-pi-ip>:" + str(PORT) if exposed else "(loopback only — set PBM_HOST=0.0.0.0 to expose on the LAN)"}
 
   Stop with Ctrl+C
 """)
+    if exposed:
+        app.logger.warning("Binding to %s — the UI is reachable from the network. "
+                           "Ensure a strong admin password is set.", host)
+
     # Install Flask if missing
     try:
         import flask
@@ -5632,4 +5802,4 @@ if __name__ == "__main__":
         import subprocess
         subprocess.run(["pip3","install","flask","--break-system-packages","-q"], check=True)
 
-    app.run(host="0.0.0.0", port=PORT, debug=False, threaded=True)
+    app.run(host=host, port=PORT, debug=False, threaded=True)

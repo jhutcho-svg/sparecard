@@ -8,7 +8,7 @@ A web-based Raspberry Pi image backup manager for Runtipi + Raspbian setups.
 
 ## What is this?
 
-Pi Backup Manager is a self-hosted web UI that automates full SD card / boot disk image backups of your Raspberry Pi using [RonR's image-backup tools](https://github.com/seamusdemora/RonR-RPi-image-utils). It's the backup GUI that Runtipi doesn't have built-in.
+Pi Backup Manager is a self-hosted web UI that automates full image backups of your Raspberry Pi's boot device — SD card, USB SSD, NVMe, or any other block device — using [RonR's image-backup tools](https://github.com/seamusdemora/RonR-RPi-image-utils). It's the backup GUI that Runtipi doesn't have built-in.
 
 You configure your backup destination, schedule, and notification settings through the browser. The app generates and installs a shell script that runs on cron — stopping your containers, backing up the image incrementally, restarting everything, and notifying you when done.
 
@@ -156,6 +156,21 @@ Key config options:
 ## Changelog
 
 All notable changes are documented here. This is the single source of truth for release history.
+
+---
+
+### 2026-06-10
+
+#### Security
+
+- **Command injection eliminated** — `sh()`/`sudo()` string-shell runners removed entirely. All ~70 call sites now use `run(argv, …)` / `sudo_run(argv, …)`, which pass argument lists to `subprocess` with no shell. User-supplied values (passwords, mount options, device paths, IQNs, etc.) can no longer be interpreted as shell syntax. A `merge=True` flag replaces `2>&1`; `command -v` checks replaced with `shutil.which`; the install image glob is expanded in Python; the `repr()`-as-shell-quoting hack in cron/remove replaced with the `crontab -` stdin approach.
+- **CSRF + loopback binding** — a `before_request` check (`_csrf_ok`) rejects any mutating `/api` request that lacks the `X-PBM-CSRF: 1` header, and rejects a foreign `Origin` even when the header is present. Safe GETs and the pre-auth setup routes are exempt. The frontend gained a small fetch wrapper that attaches the header automatically. The server now binds `127.0.0.1` by default; set `PBM_HOST=0.0.0.0` to expose on the LAN.
+- **Auth hardening** — a verified-credential cache means PBKDF2 runs ~once per client per 5 minutes instead of on every request; the cache is cleared immediately on password change so old credentials cannot linger. The rate-limiter dict is now pruned on each auth attempt and hard-capped at 1024 IPs to bound memory use. Entering open-setup mode (no auth file) logs a one-time warning.
+- **Restore safety** — boot-device and restore-target both normalise through a shared `_disk_base()` helper, closing the old digit-stripping bypass on `mmcblk`/`nvme` naming (`mmcblk0p2` → `mmcblk0`, not the broken `mmcblk0p`). `/api/restore/run` now requires a whole disk (partitions rejected), requires `confirmDevice` to echo the target back, verifies the image file exists before opening the thread, and refuses the boot disk up-front — with the worker thread re-checking again right before writing.
+
+#### Changed
+- `_disk_base()` shared helper introduced to normalise `sda1→sda`, `mmcblk0p2→mmcblk0`, `nvme0n1p3→nvme0n1` consistently across mount status and restore paths
+- `/proc/device-tree/model` read via `Path.read_text()` instead of a shell `cat | tr` pipeline
 
 ---
 
