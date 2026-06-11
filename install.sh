@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Pi Backup Manager — installer
+# SpareCard — installer
 # Usage:  bash install.sh
 # Run as a normal user (not root). sudo access is required for systemd setup.
 # ─────────────────────────────────────────────────────────────────────────────
@@ -71,7 +71,7 @@ else
 fi
 info "Package manager: $PKG_MGR"
 
-info "Installing Pi Backup Manager for user: $USER"
+info "Installing SpareCard for user: $USER"
 info "Install directory: $INSTALL_DIR"
 info "Service port:      $PORT"
 echo
@@ -218,7 +218,7 @@ esac
 
 if [[ -n "$PKG_BIN_PATH" ]]; then
     sudo tee "$SUDOERS_FILE" > /dev/null <<EOF
-# Pi Backup Manager — allows web UI to install optional dependencies (iSCSI, NFS, SMB)
+# SpareCard — allows web UI to install optional dependencies (iSCSI, NFS, SMB)
 $USER ALL=(ALL) NOPASSWD: $PKG_BIN_PATH $SUDO_ARGS
 EOF
     sudo chmod 440 "$SUDOERS_FILE"
@@ -236,7 +236,7 @@ fi
 step "Writing systemd service…"
 sudo tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=Pi Backup Manager Web UI
+Description=SpareCard Web UI
 After=network.target
 After=docker.socket
 Wants=docker.socket
@@ -270,7 +270,7 @@ STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)
 echo
 if [[ "$STATUS" == "active" ]]; then
     LOCAL_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-    echo -e "${GREEN}  ✓ Pi Backup Manager is running!${NC}"
+    echo -e "${GREEN}  ✓ SpareCard is running!${NC}"
     echo
     echo "  Open in your browser:"
     echo "    http://localhost:$PORT"

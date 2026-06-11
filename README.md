@@ -1,6 +1,6 @@
-# Pi Backup Manager
+# SpareCard
 
-A web-based Raspberry Pi image backup manager for Runtipi + Raspbian setups.
+Keep a bootable spare of your Raspberry Pi — a web-based image backup manager for Runtipi + Raspbian setups. *(Formerly "Pi Backup Manager".)*
 
 ![Destination](screenshots/destination.png)
 
@@ -8,7 +8,7 @@ A web-based Raspberry Pi image backup manager for Runtipi + Raspbian setups.
 
 ## What is this?
 
-Pi Backup Manager is a self-hosted web UI that automates full image backups of your Raspberry Pi's boot device — SD card, USB SSD, NVMe, or any other block device — using [RonR's image-backup tools](https://github.com/seamusdemora/RonR-RPi-image-utils). It's the backup GUI that Runtipi doesn't have built-in.
+SpareCard is a self-hosted web UI that automates full image backups of your Raspberry Pi's boot device — SD card, USB SSD, NVMe, or any other block device — using [RonR's image-backup tools](https://github.com/seamusdemora/RonR-RPi-image-utils). It's the backup GUI that Runtipi doesn't have built-in.
 
 You configure your backup destination, schedule, and notification settings through the browser. The app generates and installs a shell script that runs on cron — stopping your containers, backing up the image incrementally, restarting everything, and notifying you when done.
 
@@ -51,8 +51,8 @@ You configure your backup destination, schedule, and notification settings throu
 ## Installation
 
 ```bash
-git clone https://github.com/jhutcho-svg/pi-backup-manager.git
-cd pi-backup-manager
+git clone https://github.com/jhutcho-svg/sparecard.git
+cd sparecard
 bash install.sh
 ```
 
@@ -99,7 +99,7 @@ PBM_PORT=8080 bash install.sh
 
 `image-backup` requires the `-i` flag on the **first run only** to initialise the image file. After that, runs are incremental (much faster).
 
-Pi Backup Manager tracks this automatically via a sentinel file (`$BACKUP_ROOT/.image_initialised`):
+SpareCard tracks this automatically via a sentinel file (`$BACKUP_ROOT/.image_initialised`):
 - Sentinel **absent** → first run, full image created
 - Sentinel **present** → incremental update
 

@@ -1,4 +1,4 @@
-# Pi Backup Manager — `server.py` Hardening & Improvement Handoff
+# SpareCard (formerly Pi Backup Manager) — `server.py` Hardening & Improvement Handoff
 
 Handoff for Claude Code. Single-file Flask app (`server.py`, ~5,800 lines). The
 **security recommendations 1–4 are already applied** in this file. This document
