@@ -6,9 +6,10 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-INSTALL_DIR="$HOME/pi-backup-manager"
-SERVICE_NAME="pi-backup-manager"
+INSTALL_DIR="$HOME/sparecard"
+SERVICE_NAME="sparecard"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+OLD_SERVICE_NAME="pi-backup-manager"   # pre-rebrand name, cleaned up below
 PORT="${PBM_PORT:-7823}"
 IMGBAK_REPO="$HOME/RonR-RPi-image-utils"
 IMGBAK_BIN="/usr/local/sbin/image-backup"
@@ -202,9 +203,27 @@ else
     warn "Then restart the service:     sudo systemctl restart $SERVICE_NAME"
 fi
 
+# ── Clean up pre-rebrand (Pi Backup Manager) service & sudoers ────────────────
+if [[ -f "/etc/systemd/system/${OLD_SERVICE_NAME}.service" || -f "/etc/sudoers.d/${OLD_SERVICE_NAME}" ]]; then
+    step "Removing old ${OLD_SERVICE_NAME} service/sudoers (renamed to ${SERVICE_NAME})…"
+    if [[ -f "/etc/systemd/system/${OLD_SERVICE_NAME}.service" ]]; then
+        sudo systemctl disable --now "$OLD_SERVICE_NAME" 2>/dev/null || true
+        sudo rm -f "/etc/systemd/system/${OLD_SERVICE_NAME}.service"
+        sudo systemctl daemon-reload
+        info "Old service removed."
+    fi
+    if [[ -f "/etc/sudoers.d/${OLD_SERVICE_NAME}" ]]; then
+        sudo rm -f "/etc/sudoers.d/${OLD_SERVICE_NAME}"
+        info "Old sudoers entry removed."
+    fi
+    if [[ -d "$HOME/$OLD_SERVICE_NAME" && ! "$HOME/$OLD_SERVICE_NAME" -ef "$INSTALL_DIR" ]]; then
+        warn "Old install dir $HOME/$OLD_SERVICE_NAME left in place — remove it once you're happy with the new install."
+    fi
+fi
+
 # ── Write sudoers entry (allows web UI to install optional dependencies) ──────
 step "Writing sudoers entry for dependency installer…"
-SUDOERS_FILE="/etc/sudoers.d/pi-backup-manager"
+SUDOERS_FILE="/etc/sudoers.d/sparecard"
 case "$PKG_MGR" in
     apt)    PKG_BIN_PATH="$(command -v apt-get)"; SUDO_ARGS="install -y *" ;;
     pacman) PKG_BIN_PATH="$(command -v pacman)";  SUDO_ARGS="-S --noconfirm --needed *" ;;

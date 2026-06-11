@@ -122,7 +122,7 @@ Enter your Runtipi username and password in the **Config** tab to enable the API
 
 ## Configuration
 
-All settings are saved in `~/pi-backup-manager/config.json`. The main options are set through the UI tabs — no manual file editing needed.
+All settings are saved in `~/.pi-backup-manager.json`. The main options are set through the UI tabs — no manual file editing needed.
 
 Key config options:
 
