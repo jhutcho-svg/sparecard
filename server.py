@@ -6,15 +6,33 @@ Then open: http://<pi-ip>:7823
 """
 
 import base64, hashlib, json, logging, os, re, secrets, shlex, shutil, subprocess, tempfile, threading, time, queue, calendar
+import urllib.error, urllib.request
 from datetime import datetime
 from glob import glob
 from pathlib import Path
 from urllib.parse import urlparse
-from flask import Flask, jsonify, request, Response
+from flask import Flask, abort, jsonify, make_response, request, Response
 
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024  # 2 MB body cap -> 413
+
+@app.errorhandler(413)
+def _too_large(e):
+    return jsonify({"error": "Request body too large (2 MB max)"}), 413
+
+def _body():
+    """Parsed JSON object from the request body, or a clean JSON 400.
+    Replaces the old get_json(force=True) calls, which leaked an HTML
+    traceback page on malformed JSON. force=True keeps tolerating a missing
+    Content-Type header; silent=True turns parse errors into None."""
+    data = request.get_json(force=True, silent=True)
+    if not isinstance(data, dict):
+        abort(make_response(jsonify({"error": "Invalid or missing JSON body"}), 400))
+    return data
+
 CONFIG_FILE = Path(os.environ.get("PBM_CONFIG", Path.home() / ".pi-backup-manager.json"))
 PORT = int(os.environ.get("PBM_PORT", 7823))
+JOB_LOG_DIR = Path(os.environ.get("PBM_LOG_DIR", Path.home() / ".pbm"))  # per-run job logs
 
 # ── Authentication ─────────────────────────────────────────────────────────────
 AUTH_FILE = Path(os.environ.get("PBM_AUTH", Path.home() / ".pi-backup-manager-auth.json"))
@@ -256,7 +274,7 @@ def setup_page():
 def api_auth_setup():
     if AUTH_FILE.exists():
         return jsonify({"error": "Already configured. Use Change Password instead."}), 400
-    d = request.get_json(force=True)
+    d = _body()
     username = d.get("username", "").strip()
     password = d.get("password", "")
     if not username or not password:
@@ -270,7 +288,7 @@ def api_auth_setup():
 
 @app.route("/api/auth/change", methods=["POST"])
 def api_auth_change():
-    d = request.get_json(force=True)
+    d = _body()
     current_pw = d.get("currentPassword", "")
     new_pw     = d.get("newPassword", "")
     if not current_pw or not new_pw:
@@ -292,11 +310,151 @@ def api_auth_change():
     app.logger.info("Admin password changed; auth cache cleared.")
     return jsonify({"ok": True})
 
-# ── live backup log queue (for SSE streaming) ─────────────────────────────────
-_backup_queue       = queue.Queue()
-_backup_status      = {"running": False, "result": None}   # "success" | "failed" | None
-_backup_lock        = threading.Lock()
-_backup_log_history = []   # rolling replay buffer for SSE reconnects
+# ── streamable background jobs (SSE) ──────────────────────────────────────────
+
+class Job:
+    """One streamable background job (backup, verify, compact, …).
+
+    Each connected SSE client gets its OWN queue (fan-out), so multiple
+    browser tabs all receive every log line and the correct `done` event —
+    the previous single shared queue made tabs steal each other's messages.
+    A rolling history buffer is replayed to clients that connect mid-job.
+    Every event is also teed to JOB_LOG_DIR/<name>-<YYYYmmdd-HHMMSS>.log
+    (flushed per line, so an interrupted restore still leaves a trail).
+    """
+    HISTORY_MAX = 500
+    LOG_KEEP    = 10    # rotated per-run log files kept per job
+
+    def __init__(self, name):
+        self.name    = name
+        self.status  = {"running": False, "result": None}  # "success"|"failed"|…|None
+        self.lock    = threading.Lock()
+        self.history = []   # events of the current/last run, for replay on connect
+        self._subs   = []   # one queue PER connected client
+        self._logf   = None
+
+    @property
+    def running(self):
+        return self.status["running"]
+
+    def start(self, target, *args):
+        """Run target(job, *args) in a daemon thread. False if already running."""
+        with self.lock:
+            if self.status["running"]:
+                return False
+            self.status = {"running": True, "result": None}
+            self.history = []
+            self._open_log()
+        threading.Thread(target=self._guard, args=(target, args), daemon=True).start()
+        return True
+
+    def _open_log(self):
+        """Open this run's log file and rotate old ones. Never raises —
+        a failed disk log must not block the job itself."""
+        try:
+            JOB_LOG_DIR.mkdir(mode=0o700, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            self._logf = open(JOB_LOG_DIR / f"{self.name}-{ts}.log", "a", encoding="utf-8")
+            for old in sorted(JOB_LOG_DIR.glob(f"{self.name}-*.log"))[:-self.LOG_KEEP]:
+                try: old.unlink()
+                except OSError: pass
+        except Exception:
+            self._logf = None
+
+    def _log_to_disk(self, ev):
+        if not self._logf:
+            return
+        try:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if ev.get("type") == "log":
+                line = f"{ts} [{ev.get('level', 'info'):4}] {ev.get('msg', '')}"
+            elif ev.get("type") == "done":
+                extra = {k: v for k, v in ev.items() if k not in ("type", "result")}
+                line = f"{ts} [done] result={ev.get('result')}" + \
+                       (f" {json.dumps(extra)}" if extra else "")
+            else:
+                line = f"{ts} [{ev.get('type')}] {json.dumps(ev)}"
+            self._logf.write(line + "\n")
+            self._logf.flush()
+        except Exception:
+            self._close_log()
+
+    def _close_log(self):
+        if self._logf:
+            try: self._logf.close()
+            except Exception: pass
+            self._logf = None
+
+    def _guard(self, target, args):
+        try:
+            target(self, *args)
+        except Exception as e:
+            self.emit(f"Exception: {e}", "err")
+            if self.status["running"]:
+                self.finish("failed", error=str(e))
+        finally:
+            if self.status["running"]:   # target returned without calling finish()
+                self.finish("failed")
+
+    def _publish(self, ev):
+        with self.lock:
+            self.history.append(ev)
+            if len(self.history) > self.HISTORY_MAX:
+                self.history.pop(0)
+            self._log_to_disk(ev)
+            subs = list(self._subs)
+        for q in subs:
+            q.put(ev)
+
+    def emit(self, msg, level="info"):
+        self._publish({"type": "log", "msg": msg, "level": level})
+
+    def event(self, ev):
+        """Publish a custom event dict, e.g. {"type":"phase","phase":2}."""
+        self._publish(ev)
+
+    def finish(self, result, **extra):
+        with self.lock:
+            self.status = {"running": False, "result": result}
+        self._publish({"type": "done", "result": result, **extra})
+        with self.lock:
+            self._close_log()
+
+    def stream(self):
+        """SSE response: replays history, then live events until `done`."""
+        q = queue.Queue()
+        with self.lock:
+            backlog = list(self.history)
+            self._subs.append(q)
+        def gen():
+            try:
+                yield 'data: {"type":"connected"}\n\n'
+                for ev in backlog:
+                    yield f"data: {json.dumps(ev)}\n\n"
+                    if ev.get("type") == "done":
+                        return
+                while True:
+                    try:
+                        ev = q.get(timeout=30)
+                    except queue.Empty:
+                        yield 'data: {"type":"ping"}\n\n'
+                        continue
+                    yield f"data: {json.dumps(ev)}\n\n"
+                    if ev.get("type") == "done":
+                        break
+            finally:
+                with self.lock:
+                    try: self._subs.remove(q)
+                    except ValueError: pass
+        return Response(gen(), mimetype="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+backup_job  = Job("backup")
+verify_job  = Job("verify")
+compact_job = Job("compact")
+install_job = Job("install")
+imgbak_job  = Job("imgbak")
+restore_job = Job("restore")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -344,6 +502,29 @@ def _disk_base(dev):
     if m:
         return m.group(1)
     return re.sub(r'\d+$', '', name)  # sd/vd/hd/xvd style
+
+def _human_size(n):
+    """Bytes -> short human string in lsblk style, e.g. 14.9G."""
+    n = float(n or 0)
+    for unit in ("B", "K", "M", "G", "T", "P"):
+        if n < 1024 or unit == "P":
+            return f"{n:.0f}{unit}" if n >= 100 or unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024
+
+def _image_stats(path):
+    """Size info for an image file from a single stat() call — no subprocess.
+    Sparse (allocated) size comes from st_blocks, which is exactly what
+    `du` reports. The one place for logical/sparse size math."""
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return {"exists": False, "logical_bytes": 0, "sparse_bytes": 0,
+                "logical_mb": 0, "sparse_mb": 0}
+    sparse = st.st_blocks * 512
+    return {"exists": True,
+            "logical_bytes": st.st_size, "sparse_bytes": sparse,
+            "logical_mb": st.st_size // (1024 * 1024),
+            "sparse_mb":  sparse // (1024 * 1024)}
 
 def _valid_disk(s):
     """A whole block *disk* (not a partition) usable as a restore target."""
@@ -451,10 +632,38 @@ def api_config_get():
             pass
     return jsonify({})
 
+# Every key the UI's collectConfig() can send, plus legacy keys older config
+# files may carry (scriptPath, cronHuman) so a load -> save round-trip survives.
+_CONFIG_ALLOWED_KEYS = {
+    "version",
+    # destination
+    "destType", "secondaryDests", "mountPoint", "imageName",
+    "iscsiPortal", "iscsiPort", "iscsiIQN", "iscsiDevice",
+    "smbServer", "smbShare", "smbUser", "smbDomain", "smbVersion", "smbExtraOpts",
+    "nfsServer", "nfsExport", "nfsMountOpts", "nfsCustomOpts",
+    "usbDevice", "usbFsType", "localPath",
+    # notifications
+    "ntfyEnabled", "notifySuccess", "notifyFailure", "notifyStart",
+    "ntfyTopic", "ntfyServer",
+    # shutdown / containers
+    "shutdownMethod", "shutdownFallback", "gracePeriod", "settleTime",
+    "healthTimeout", "containerCfg", "tipiDir", "tipiUser", "tipiPass",
+    # schedule
+    "cronMode", "cronDays", "cronExpr", "cronHuman", "cronFreq",
+    "cronHour", "cronMin", "customCron",
+    # backup script / logging
+    "scriptPath", "maxLogLines", "logPath", "lockFile", "imageHeadroom",
+}
+
 @app.route("/api/config", methods=["POST"])
 def api_config_post():
+    data = _body()
+    unknown = sorted(set(data) - _CONFIG_ALLOWED_KEYS)
+    if unknown:
+        return jsonify({"error": f"Unknown config keys: {', '.join(unknown)}"}), 400
+    data["version"] = 1
     try:
-        CONFIG_FILE.write_text(json.dumps(request.get_json(force=True), indent=2))
+        CONFIG_FILE.write_text(json.dumps(data, indent=2))
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -486,7 +695,7 @@ def api_mount_status():
 
 @app.route("/api/mount/do", methods=["POST"])
 def api_mount_do():
-    d = request.get_json(force=True)
+    d = _body()
     action = d.get("action", "mount")    # "mount" | "unmount"
     path   = d.get("mountPoint", "")
 
@@ -563,7 +772,7 @@ def api_mount_do():
 @app.route("/api/mount/fstab", methods=["POST"])
 def api_fstab():
     """Append an fstab entry (idempotent)."""
-    d    = request.get_json(force=True)
+    d    = _body()
     line = d.get("line","").strip()
     if not line:
         return jsonify({"error": "No fstab line"}), 400
@@ -594,7 +803,7 @@ def api_fstab_check():
 @app.route("/api/mount/fstab/remove", methods=["POST"])
 def api_fstab_remove():
     """Remove all fstab entries whose mount point (field 2) matches the given path."""
-    mount_point = request.get_json(force=True).get("mountPoint", "").strip()
+    mount_point = _body().get("mountPoint", "").strip()
     if not mount_point:
         return jsonify({"error": "mountPoint required"}), 400
     try:
@@ -643,7 +852,7 @@ def _iscsi_devices_by_iqn():
 
 @app.route("/api/iscsi/discover", methods=["POST"])
 def api_iscsi_discover():
-    d      = request.get_json(force=True)
+    d      = _body()
     portal = d.get("portal","").strip()
     port   = d.get("port","3260")
     if not _valid_hostname(portal):
@@ -664,7 +873,7 @@ def api_iscsi_discover():
 
 @app.route("/api/iscsi/login", methods=["POST"])
 def api_iscsi_login():
-    d      = request.get_json(force=True)
+    d      = _body()
     portal = d.get("portal","").strip()
     iqn    = d.get("iqn","").strip()
     port   = d.get("port","3260")
@@ -688,7 +897,7 @@ def api_iscsi_login():
 
 @app.route("/api/iscsi/logout", methods=["POST"])
 def api_iscsi_logout():
-    d   = request.get_json(force=True)
+    d   = _body()
     iqn = d.get("iqn","").strip()
     if not _valid_iqn(iqn):
         return jsonify({"error": "Invalid IQN format"}), 400
@@ -697,7 +906,7 @@ def api_iscsi_logout():
 
 @app.route("/api/iscsi/autostart", methods=["POST"])
 def api_iscsi_autostart():
-    d      = request.get_json(force=True)
+    d      = _body()
     iqn    = d.get("iqn","").strip()
     enable = d.get("enable", True)
     if not _valid_iqn(iqn):
@@ -731,7 +940,7 @@ def api_iscsi_sessions():
 
 @app.route("/api/nfs/exports", methods=["POST"])
 def api_nfs_exports():
-    d      = request.get_json(force=True)
+    d      = _body()
     server = d.get("server","").strip()
     if not server or not re.match(r'^[\w.\-]+$', server):
         return jsonify({"error": "Invalid or missing server address"}), 400
@@ -777,7 +986,7 @@ def api_usb_uuid():
 
 @app.route("/api/local/verify", methods=["POST"])
 def api_local_verify():
-    path = request.get_json(force=True).get("path","").strip()
+    path = _body().get("path","").strip()
     p    = Path(path)
     ok   = p.is_dir() and os.access(path, os.W_OK)
     df   = ""
@@ -797,7 +1006,7 @@ def api_cron_get():
 
 @app.route("/api/cron", methods=["POST"])
 def api_cron_post():
-    d           = request.get_json(force=True)
+    d           = _body()
     cron_line   = d.get("cronLine","").strip()
     script_path = d.get("scriptPath", str(Path.home() / "weekly_image.sh"))
     log_path    = d.get("logPath",    str(Path.home() / "cron_debug.log"))
@@ -840,7 +1049,7 @@ def api_script_read():
 
 @app.route("/api/script", methods=["POST"])
 def api_script():
-    d       = request.get_json(force=True)
+    d       = _body()
     content = d.get("script","")
     path    = d.get("path", str(Path.home() / "weekly_image.sh"))
     if not content:
@@ -876,7 +1085,7 @@ def api_config_defaults():
 
 @app.route("/api/runtipi/test", methods=["POST"])
 def api_runtipi_test():
-    d    = request.get_json(force=True)
+    d    = _body()
     user = d.get("tipiUser", "").strip()
     pw   = d.get("tipiPass", "").strip()
     if not user or not pw:
@@ -890,8 +1099,7 @@ def api_runtipi_test():
 
     base_url = f"http://{ip}:3000"
 
-    import json as _json, urllib.request, urllib.error
-    payload = _json.dumps({"username": user, "password": pw}).encode()
+    payload = json.dumps({"username": user, "password": pw}).encode()
     req = urllib.request.Request(
         f"{base_url}/api/auth/login",
         data=payload,
@@ -900,7 +1108,7 @@ def api_runtipi_test():
     )
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:
-            body = _json.loads(resp.read())
+            body = json.loads(resp.read())
             if body.get("success"):
                 return jsonify({"ok": True, "url": base_url, "message": f"Login successful ({base_url})"})
             return jsonify({"ok": False, "error": f"Unexpected response: {body}"})
@@ -916,7 +1124,7 @@ def api_runtipi_test():
 
 @app.route("/api/smb/test", methods=["POST"])
 def api_smb_test():
-    d      = request.get_json(force=True)
+    d      = _body()
     server = d.get("smbServer","").strip()
     user   = d.get("smbUser","").strip()
     pw     = d.get("smbPass","").strip()
@@ -941,7 +1149,7 @@ def api_smb_test():
 @app.route("/api/smb/credentials", methods=["POST"])
 def api_smb_credentials():
     """Write SMB credentials to /etc/samba/credentials (mode 600, root-owned)."""
-    d    = request.get_json(force=True)
+    d    = _body()
     user = d.get("smbUser","").strip()
     pw   = d.get("smbPass","").strip()
     if not user:
@@ -969,79 +1177,43 @@ _BACKUP_PHASE_PATTERNS = [
     (3, "All done"),
 ]
 
-def _run_backup_thread(script_path):
-    global _backup_status
-    with _backup_lock:
-        _backup_status = {"running": True, "result": None}
-    try:
-        proc = subprocess.Popen(
-            ["bash", script_path],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1
-        )
-        # Keep a rolling buffer for SSE reconnect replay (last 500 lines)
-        _backup_log_history.clear()
-        for line in proc.stdout:
-            stripped = line.rstrip()
-            msg = {"type": "log", "msg": stripped}
-            _backup_queue.put(msg)
-            _backup_log_history.append(msg)
-            if len(_backup_log_history) > 500:
-                _backup_log_history.pop(0)
-            for phase, kw in _BACKUP_PHASE_PATTERNS:
-                if kw in stripped:
-                    _backup_queue.put({"type": "phase", "phase": phase})
-                    break
-        proc.wait()
-        result = "success" if proc.returncode == 0 else "failed"
-        done_msg = {"type": "done", "result": result, "code": proc.returncode}
-        _backup_queue.put(done_msg)
-        _backup_log_history.append(done_msg)
-        with _backup_lock:
-            _backup_status = {"running": False, "result": result}
-    except Exception as e:
-        done_msg = {"type": "done", "result": "failed", "error": str(e)}
-        _backup_queue.put(done_msg)
-        with _backup_lock:
-            _backup_status = {"running": False, "result": "failed"}
+def _run_backup_thread(job, script_path):
+    proc = subprocess.Popen(
+        ["bash", script_path],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1
+    )
+    for line in proc.stdout:
+        stripped = line.rstrip()
+        job.emit(stripped)
+        for phase, kw in _BACKUP_PHASE_PATTERNS:
+            if kw in stripped:
+                job.event({"type": "phase", "phase": phase})
+                break
+    proc.wait()
+    result = "success" if proc.returncode == 0 else "failed"
+    job.finish(result, code=proc.returncode)
 
 @app.route("/api/backup/run", methods=["POST"])
 def api_backup_run():
-    with _backup_lock:
-        if _backup_status["running"]:
-            return jsonify({"error": "Backup already running"}), 409
-    d           = request.get_json(force=True)
+    if backup_job.running:
+        return jsonify({"error": "Backup already running"}), 409
+    d           = _body()
     script_path = d.get("scriptPath", str(Path.home() / "weekly_image.sh"))
     if not Path(script_path).exists():
         return jsonify({"error": f"Script not found: {script_path}. Generate and save it first."}), 404
-    # clear queue and history
-    while not _backup_queue.empty():
-        try: _backup_queue.get_nowait()
-        except: pass
-    _backup_log_history.clear()
-    t = threading.Thread(target=_run_backup_thread, args=(script_path,), daemon=True)
-    t.start()
+    if not backup_job.start(_run_backup_thread, script_path):
+        return jsonify({"error": "Backup already running"}), 409
     return jsonify({"ok": True})
 
 @app.route("/api/backup/stream")
 def api_backup_stream():
     """Server-Sent Events stream of live backup log lines."""
-    def generate():
-        yield "data: {\"type\":\"connected\"}\n\n"
-        while True:
-            try:
-                msg = _backup_queue.get(timeout=30)
-                yield f"data: {json.dumps(msg)}\n\n"
-                if msg.get("type") == "done":
-                    break
-            except queue.Empty:
-                yield "data: {\"type\":\"ping\"}\n\n"
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return backup_job.stream()
 
 @app.route("/api/backup/status")
 def api_backup_status():
-    return jsonify(_backup_status)
+    return jsonify(backup_job.status)
 
 def _parse_log_ts(s):
     """Parse 'Sun  8 Mar 03:06:48 AEDT 2026' → unix timestamp (local time), or None."""
@@ -1080,10 +1252,16 @@ def api_backup_last():
             cfg = json.load(f)
     except Exception:
         pass
+    return jsonify(_compute_last_backup(cfg))
+
+def _compute_last_backup(cfg):
+    """Last backup result/timing parsed from the log file, as a plain dict —
+    shared by the route above and the dashboard (which used to re-enter the
+    route through a fake test_request_context)."""
     log_path = cfg.get("logPath", str(Path.home() / "cron_debug.log"))
 
     out = {"result": None, "started": None, "finished": None,
-           "elapsed": None, "finished_ts": None, "running": _backup_status["running"],
+           "elapsed": None, "finished_ts": None, "running": backup_job.running,
            "log_lines": []}
 
     try:
@@ -1093,10 +1271,10 @@ def api_backup_last():
         lines = result.stdout.splitlines(keepends=True) if result.returncode == 0 else []
         if not lines:
             _apply_sentinel_fallback(cfg, out)
-            return jsonify(out)
+            return out
     except Exception:
         _apply_sentinel_fallback(cfg, out)
-        return jsonify(out)
+        return out
 
     # Find the last "Weekly Image Backup" start marker
     start_idx = None
@@ -1106,7 +1284,7 @@ def api_backup_last():
             break
     if start_idx is None:
         _apply_sentinel_fallback(cfg, out)
-        return jsonify(out)
+        return out
 
     line = lines[start_idx]
     sep = ": ---"
@@ -1154,28 +1332,20 @@ def api_backup_last():
     if not out["result"]:
         _apply_sentinel_fallback(cfg, out)
 
-    return jsonify(out)
+    return out
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API — Image verify (losetup + fsck, SSE stream)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_verify_queue  = queue.Queue()
-_verify_status = {"running": False, "result": None}
-
-def _run_verify_thread(image_path):
-    global _verify_status
-    _verify_status = {"running": True, "result": None}
+def _run_verify_thread(job, image_path):
+    emit = job.emit
     loop_dev = None
-
-    def emit(msg, level="info"):
-        _verify_queue.put({"type": "log", "msg": msg, "level": level})
 
     try:
         if not Path(image_path).exists():
             emit(f"Image not found: {image_path}", "err")
-            _verify_queue.put({"type": "done", "result": "failed"})
-            _verify_status = {"running": False, "result": "failed"}
+            job.finish("failed")
             return
 
         emit(f"► Attaching loop device for {image_path} …", "cmd")
@@ -1183,8 +1353,7 @@ def _run_verify_thread(image_path):
         loop_dev = out.strip()
         if rc != 0 or not loop_dev:
             emit(f"losetup failed — {err or out}", "err")
-            _verify_queue.put({"type": "done", "result": "failed"})
-            _verify_status = {"running": False, "result": "failed"}
+            job.finish("failed")
             return
         emit(f"Loop device: {loop_dev}", "ok")
 
@@ -1229,55 +1398,33 @@ def _run_verify_thread(image_path):
         else:
             result = "failed"
 
-        _verify_queue.put({"type": "done", "result": result})
-        _verify_status = {"running": False, "result": result}
+        job.finish(result)
 
-    except Exception as e:
-        emit(f"Exception: {e}", "err")
-        _verify_queue.put({"type": "done", "result": "failed"})
-        _verify_status = {"running": False, "result": "failed"}
     finally:
         if loop_dev:
             sudo_run(["losetup", "-d", loop_dev], timeout=10)
 
 @app.route("/api/verify/run", methods=["POST"])
 def api_verify_run():
-    if _verify_status["running"]:
+    if verify_job.running:
         return jsonify({"error": "Verify already running"}), 409
-    if _backup_status["running"]:
+    if backup_job.running:
         return jsonify({"error": "Backup is running — wait for it to finish"}), 409
-    d = request.get_json(force=True)
+    d = _body()
     image_path = d.get("imagePath", "")
     if not image_path:
         return jsonify({"error": "No imagePath provided"}), 400
-    while not _verify_queue.empty():
-        try: _verify_queue.get_nowait()
-        except: pass
-    t = threading.Thread(target=_run_verify_thread, args=(image_path,), daemon=True)
-    t.start()
+    if not verify_job.start(_run_verify_thread, image_path):
+        return jsonify({"error": "Verify already running"}), 409
     return jsonify({"ok": True})
 
 @app.route("/api/verify/stream")
 def api_verify_stream():
-    def generate():
-        yield "data: {\"type\":\"connected\"}\n\n"
-        while True:
-            try:
-                msg = _verify_queue.get(timeout=30)
-                yield f"data: {json.dumps(msg)}\n\n"
-                if msg.get("type") == "done":
-                    break
-            except queue.Empty:
-                yield "data: {\"type\":\"ping\"}\n\n"
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return verify_job.stream()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API — Image status & compact (sparsify)
 # ─────────────────────────────────────────────────────────────────────────────
-
-_compact_queue  = queue.Queue()
-_compact_status = {"running": False, "result": None}
 
 @app.route("/api/image-status")
 def api_image_status():
@@ -1293,21 +1440,17 @@ def api_image_status():
         "headroom_mb": headroom_mb, "wasted_mb": 0,
         "compact_recommended": False,
     }
-    if not Path(image_path).exists():
+    stats = _image_stats(image_path)
+    if not stats["exists"]:
         return jsonify(result)
 
     result["exists"]     = True
-    result["logical_mb"] = Path(image_path).stat().st_size // (1024 * 1024)
-
-    out, _, rc = run(["du", "-s", "--block-size=1", image_path])
-    if rc == 0:
-        try: result["sparse_mb"] = int(out.split()[0]) // (1024 * 1024)
-        except Exception: pass
-
-    out, _, rc = run(["df", "-BM", "--output=used", "/"])
-    if rc == 0:
-        try: result["source_used_mb"] = int(out.splitlines()[-1].strip().rstrip("M"))
-        except Exception: pass
+    result["logical_mb"] = stats["logical_mb"]
+    result["sparse_mb"]  = stats["sparse_mb"]
+    try:
+        result["source_used_mb"] = shutil.disk_usage("/").used // (1024 * 1024)
+    except OSError:
+        pass
 
     wasted = result["sparse_mb"] - result["source_used_mb"] - headroom_mb
     result["wasted_mb"]           = max(0, wasted)
@@ -1315,26 +1458,19 @@ def api_image_status():
     return jsonify(result)
 
 
-def _run_compact_thread(image_path):
-    global _compact_status
-    _compact_status = {"running": True, "result": None}
+def _run_compact_thread(job, image_path):
+    emit = job.emit
     loop_dev = None
     mnt = "/tmp/pbm_compact_mnt"
-
-    def emit(msg, level="info"):
-        _compact_queue.put({"type": "log", "msg": msg, "level": level})
 
     try:
         if not Path(image_path).exists():
             emit(f"Image not found: {image_path}", "err")
-            _compact_queue.put({"type": "done", "result": "failed"})
-            _compact_status = {"running": False, "result": "failed"}
+            job.finish("failed")
             return
 
-        before_bytes = Path(image_path).stat().st_size
-        out, _, _ = run(["du", "-s", "--block-size=1", image_path])
-        try:    before_sparse = int(out.split()[0])
-        except: before_sparse = before_bytes
+        before = _image_stats(image_path)
+        before_bytes, before_sparse = before["logical_bytes"], before["sparse_bytes"]
 
         emit(f"► Image: {image_path}", "cmd")
         emit(f"  Logical size : {before_bytes // (1024*1024):,} MB", "info")
@@ -1346,8 +1482,7 @@ def _run_compact_thread(image_path):
         loop_dev = out.strip()
         if rc != 0 or not loop_dev:
             emit(f"losetup failed: {err or out}", "err")
-            _compact_queue.put({"type": "done", "result": "failed"})
-            _compact_status = {"running": False, "result": "failed"}
+            job.finish("failed")
             return
         emit(f"  Loop device: {loop_dev}", "ok")
         emit("", "info")
@@ -1402,10 +1537,7 @@ def _run_compact_thread(image_path):
         else:
             emit("  Holes punched.", "ok")
 
-        after_bytes = Path(image_path).stat().st_size
-        out, _, _ = run(["du", "-s", "--block-size=1", image_path])
-        try:    after_sparse = int(out.split()[0])
-        except: after_sparse = after_bytes
+        after_sparse = _image_stats(image_path)["sparse_bytes"]
 
         saved_mb = (before_sparse - after_sparse) // (1024 * 1024)
         emit("", "info")
@@ -1414,13 +1546,8 @@ def _run_compact_thread(image_path):
         emit(f"  After  : {after_sparse  // (1024*1024):,} MB on disk", "info")
         emit(f"  Saved  : {saved_mb:,} MB", "ok" if saved_mb > 0 else "info")
 
-        _compact_queue.put({"type": "done", "result": "success", "saved_mb": saved_mb})
-        _compact_status = {"running": False, "result": "success"}
+        job.finish("success", saved_mb=saved_mb)
 
-    except Exception as e:
-        emit(f"Exception: {e}", "err")
-        _compact_queue.put({"type": "done", "result": "failed"})
-        _compact_status = {"running": False, "result": "failed"}
     finally:
         if loop_dev:
             sudo_run(["losetup", "-d", loop_dev], timeout=10)
@@ -1430,42 +1557,43 @@ def _run_compact_thread(image_path):
 
 @app.route("/api/compact/run", methods=["POST"])
 def api_compact_run():
-    if _compact_status["running"]:
+    if compact_job.running:
         return jsonify({"error": "Compact already running"}), 409
-    if _backup_status["running"]:
+    if backup_job.running:
         return jsonify({"error": "Backup is running — wait for it to finish"}), 409
-    if _verify_status["running"]:
+    if verify_job.running:
         return jsonify({"error": "Verify is running — wait for it to finish"}), 409
-    d = request.get_json(force=True)
+    d = _body()
     image_path = d.get("imagePath", "")
     if not image_path:
         return jsonify({"error": "No imagePath provided"}), 400
-    while not _compact_queue.empty():
-        try: _compact_queue.get_nowait()
-        except: pass
-    threading.Thread(target=_run_compact_thread, args=(image_path,), daemon=True).start()
+    if not compact_job.start(_run_compact_thread, image_path):
+        return jsonify({"error": "Compact already running"}), 409
     return jsonify({"ok": True})
 
 
 @app.route("/api/compact/stream")
 def api_compact_stream():
-    def generate():
-        yield "data: {\"type\":\"connected\"}\n\n"
-        while True:
-            try:
-                msg = _compact_queue.get(timeout=30)
-                yield f"data: {json.dumps(msg)}\n\n"
-                if msg.get("type") == "done":
-                    break
-            except queue.Empty:
-                yield "data: {\"type\":\"ping\"}\n\n"
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return compact_job.stream()
 
+
+_dashboard_cache = {"ts": 0.0, "payload": None}
+_DASHBOARD_TTL   = 3.0   # seconds; ~10 subprocesses saved per cached hit
 
 @app.route("/api/dashboard")
 def api_dashboard():
-    """Aggregate status for dashboard: last backup, image, mount, cron."""
+    """Aggregate status for dashboard: last backup, image, mount, cron.
+    Served from a short TTL cache so rapid reloads / polling don't fork
+    tail/du/findmnt/flock/crontab on every request."""
+    now = time.monotonic()
+    if _dashboard_cache["payload"] is not None and now - _dashboard_cache["ts"] < _DASHBOARD_TTL:
+        return jsonify(_dashboard_cache["payload"])
+    payload = _compute_dashboard()
+    _dashboard_cache["payload"] = payload
+    _dashboard_cache["ts"]      = now
+    return jsonify(payload)
+
+def _compute_dashboard():
     cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
     mount_point = cfg.get("mountPoint", "/mnt/backups")
     image_name  = cfg.get("imageName",  "pi_backup.img")
@@ -1473,28 +1601,19 @@ def api_dashboard():
     lock_file   = cfg.get("lockFile",   "/tmp/weekly_image.lock")
 
     # ── Last backup (reuse existing logic) ───────────────────────────────────
-    import flask
-    with flask.current_app.test_request_context():
-        last_raw = api_backup_last().get_json()
+    last_raw = _compute_last_backup(cfg)
 
     # ── Image status ──────────────────────────────────────────────────────────
-    image_path = Path(mount_point) / image_name
+    stats = _image_stats(Path(mount_point) / image_name)
     image_info = {"exists": False}
-    if image_path.exists():
-        try:
-            st   = image_path.stat()
-            logical_mb = st.st_size // (1024 * 1024)
-            out, _, _ = run(["du", "-s", "--block-size=1M", str(image_path)])
-            sparse_mb  = int(out.split()[0]) if out.strip() else logical_mb
-            image_info = {
-                "exists": True,
-                "logical_mb": logical_mb,
-                "sparse_mb":  sparse_mb,
-                "wasted_mb":  logical_mb - sparse_mb,
-                "compact_recommended": (logical_mb - sparse_mb) > 500,
-            }
-        except Exception:
-            image_info = {"exists": True}
+    if stats["exists"]:
+        image_info = {
+            "exists": True,
+            "logical_mb": stats["logical_mb"],
+            "sparse_mb":  stats["sparse_mb"],
+            "wasted_mb":  stats["logical_mb"] - stats["sparse_mb"],
+            "compact_recommended": (stats["logical_mb"] - stats["sparse_mb"]) > 500,
+        }
 
     # ── Sentinel / lock ───────────────────────────────────────────────────────
     sentinel_exists = (Path(mount_point) / ".image_initialised").exists()
@@ -1538,15 +1657,15 @@ def api_dashboard():
     except Exception:
         pass
 
-    return jsonify({
+    return {
         "last":     last_raw,
         "image":    image_info,
         "mount":    mount_info,
         "cron":     cron_info,
         "sentinel": sentinel_exists,
         "lock":     lock_exists,
-        "running":  _backup_status.get("running", False) or lock_held,
-    })
+        "running":  backup_job.running or lock_held,
+    }
 
 
 @app.route("/api/cleanup", methods=["POST"])
@@ -1654,9 +1773,6 @@ _DEP_PKGS = {
 }
 _ALLOWED_PKGS = set(_PKG_NAME_MAP.keys())
 
-_install_queue  = queue.Queue()
-_install_status = {"running": False}
-
 @app.route("/api/deps/check")
 def api_deps_check():
     result = {}
@@ -1666,75 +1782,43 @@ def api_deps_check():
     result["fsck"] = shutil.which("fsck") is not None
     return jsonify(result)
 
-def _run_install_thread(canonical_pkg):
-    global _install_status
-    try:
-        distro_pkg = _PKG_NAME_MAP.get(canonical_pkg, {}).get(_PKG_MGR, canonical_pkg)
-        cmd = ["sudo", _PKG_BIN] + _PKG_INSTALL_ARGS.get(_PKG_MGR, ["install", "-y"]) + [distro_pkg]
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1
-        )
-        for line in proc.stdout:
-            _install_queue.put({"type": "log", "msg": line.rstrip()})
-        proc.wait()
-        result = "success" if proc.returncode == 0 else "failed"
-        _install_queue.put({"type": "done", "result": result, "code": proc.returncode})
-    except Exception as e:
-        _install_queue.put({"type": "done", "result": "failed", "error": str(e)})
-    finally:
-        _install_status = {"running": False}
+def _run_install_thread(job, canonical_pkg):
+    distro_pkg = _PKG_NAME_MAP.get(canonical_pkg, {}).get(_PKG_MGR, canonical_pkg)
+    cmd = ["sudo", _PKG_BIN] + _PKG_INSTALL_ARGS.get(_PKG_MGR, ["install", "-y"]) + [distro_pkg]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1
+    )
+    for line in proc.stdout:
+        job.emit(line.rstrip())
+    proc.wait()
+    result = "success" if proc.returncode == 0 else "failed"
+    job.finish(result, code=proc.returncode)
 
 @app.route("/api/deps/install", methods=["POST"])
 def api_deps_install():
-    if _install_status["running"]:
+    if install_job.running:
         return jsonify({"error": "Install already running"}), 409
-    pkg = request.get_json(force=True).get("package", "").strip()
+    pkg = _body().get("package", "").strip()
     if pkg not in _ALLOWED_PKGS:
         return jsonify({"error": f"Package '{pkg}' is not in the allowed list"}), 400
-    while not _install_queue.empty():
-        try: _install_queue.get_nowait()
-        except: pass
-    _install_status["running"] = True
-    t = threading.Thread(target=_run_install_thread, args=(pkg,), daemon=True)
-    t.start()
+    if not install_job.start(_run_install_thread, pkg):
+        return jsonify({"error": "Install already running"}), 409
     return jsonify({"ok": True})
 
 @app.route("/api/deps/stream")
 def api_deps_stream():
-    def generate():
-        yield "data: {\"type\":\"connected\"}\n\n"
-        while True:
-            try:
-                msg = _install_queue.get(timeout=30)
-                yield f"data: {json.dumps(msg)}\n\n"
-                if msg.get("type") == "done":
-                    break
-            except queue.Empty:
-                yield "data: {\"type\":\"ping\"}\n\n"
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return install_job.stream()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API — image-backup guided install
 # ─────────────────────────────────────────────────────────────────────────────
 
-_imgbak_queue  = queue.Queue()
-_imgbak_status = {"running": False, "result": None}
-_IMGBAK_REPO   = Path.home() / "RonR-RPi-image-utils"
+_IMGBAK_REPO = Path.home() / "RonR-RPi-image-utils"
 
-def _run_imgbak_thread(update=False):
-    global _imgbak_status
-    _imgbak_status = {"running": True, "result": None}
-
-    def emit(msg, level="info"):
-        _imgbak_queue.put({"type": "log", "msg": msg, "level": level})
-
-    def done(result):
-        _imgbak_queue.put({"type": "done", "result": result})
-        _imgbak_status["running"] = False
-        _imgbak_status["result"]  = result
+def _run_imgbak_thread(job, update=False):
+    emit, done = job.emit, job.finish
 
     try:
         # Step 1 — ensure git is available
@@ -1803,56 +1887,44 @@ def _run_imgbak_thread(update=False):
 
 @app.route("/api/imgbak/install", methods=["POST"])
 def api_imgbak_install():
-    if _imgbak_status["running"]:
+    if imgbak_job.running:
         return jsonify({"error": "Install already running"}), 409
-    update = request.get_json(force=True).get("update", False)
-    while not _imgbak_queue.empty():
-        try: _imgbak_queue.get_nowait()
-        except: pass
-    t = threading.Thread(target=_run_imgbak_thread, args=(update,), daemon=True)
-    t.start()
+    update = _body().get("update", False)
+    if not imgbak_job.start(_run_imgbak_thread, update):
+        return jsonify({"error": "Install already running"}), 409
     return jsonify({"ok": True})
 
 @app.route("/api/imgbak/stream")
 def api_imgbak_stream():
-    def generate():
-        yield "data: {\"type\":\"connected\"}\n\n"
-        while True:
-            try:
-                msg = _imgbak_queue.get(timeout=30)
-                yield f"data: {json.dumps(msg)}\n\n"
-                if msg.get("type") == "done":
-                    break
-            except queue.Empty:
-                yield "data: {\"type\":\"ping\"}\n\n"
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return imgbak_job.stream()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # API — Restore
 # ─────────────────────────────────────────────────────────────────────────────
-
-_restore_queue  = queue.Queue()
-_restore_status = {"running": False, "result": None}
 
 @app.route("/api/restore/devices")
 def api_restore_devices():
     """List block devices suitable as restore targets, flagging the boot device."""
     boot_src, _, _ = run(["findmnt", "-n", "-o", "SOURCE", "/"])
     boot_base = _disk_base(boot_src)
-    out, _, rc = run(["lsblk", "-J", "-o", "NAME,SIZE,TYPE,FSTYPE,LABEL,MODEL,TRAN,HOTPLUG"])
+    out, _, rc = run(["lsblk", "-J", "-b", "-o", "NAME,SIZE,TYPE,FSTYPE,LABEL,MODEL,TRAN,HOTPLUG"])
     devices = []
     if rc == 0:
         try:
             for d in json.loads(out).get("blockdevices", []):
                 if d.get("type") != "disk" or d["name"].startswith(("loop", "sr")):
                     continue
+                try:
+                    size_bytes = int(d.get("size") or 0)
+                except (TypeError, ValueError):
+                    size_bytes = 0
                 devices.append({
                     "name":        f"/dev/{d['name']}",
-                    "size":        d.get("size", "?"),
+                    "size":        _human_size(size_bytes),
+                    "sizeBytes":   size_bytes,
                     "model":       (d.get("model") or "").strip(),
                     "tran":        (d.get("tran")  or "").strip(),
-                    "hotplug":     d.get("hotplug", "0") == "1",
+                    "hotplug":     str(d.get("hotplug", "0")).lower() in ("1", "true"),
                     "isBootDevice": d["name"] == boot_base,
                     "partitions":  [c.get("name","") for c in (d.get("children") or [])],
                 })
@@ -1863,7 +1935,7 @@ def api_restore_devices():
 @app.route("/api/restore/verify", methods=["POST"])
 def api_restore_verify():
     """Check that an image file exists and return its size."""
-    path = request.get_json(force=True).get("imagePath", "").strip()
+    path = _body().get("imagePath", "").strip()
     p = Path(path)
     if not p.exists():
         return jsonify({"ok": False, "error": f"File not found: {path}"})
@@ -1871,17 +1943,8 @@ def api_restore_verify():
     size_gb    = round(size_bytes / (1024**3), 2)
     return jsonify({"ok": True, "path": path, "sizeBytes": size_bytes, "sizeGb": size_gb})
 
-def _run_restore_thread(image_path, target_device):
-    _restore_status["running"] = True
-    _restore_status["result"]  = None
-
-    def emit(msg, level="info"):
-        _restore_queue.put({"type": "log", "msg": msg, "level": level})
-
-    def done(result):
-        _restore_queue.put({"type": "done", "result": result})
-        _restore_status["running"] = False
-        _restore_status["result"]  = result
+def _run_restore_thread(job, image_path, target_device):
+    emit, done = job.emit, job.finish
 
     try:
         emit("=" * 60, "info")
@@ -1965,9 +2028,9 @@ def _run_restore_thread(image_path, target_device):
 
 @app.route("/api/restore/run", methods=["POST"])
 def api_restore_run():
-    if _restore_status["running"]:
+    if restore_job.running:
         return jsonify({"error": "Restore already running"}), 409
-    d = request.get_json(force=True)
+    d = _body()
     image_path    = d.get("imagePath", "").strip()
     target_device = d.get("targetDevice", "").strip()
     confirm       = d.get("confirmDevice", "").strip()
@@ -1983,31 +2046,27 @@ def api_restore_run():
     boot_src, _, _ = run(["findmnt", "-n", "-o", "SOURCE", "/"])
     if _disk_base(target_device) == _disk_base(boot_src):
         return jsonify({"error": "Refusing to restore onto the boot disk."}), 400
-    while not _restore_queue.empty():
-        try: _restore_queue.get_nowait()
-        except: pass
-    t = threading.Thread(target=_run_restore_thread, args=(image_path, target_device), daemon=True)
-    t.start()
+    # Reject an image larger than the target — a raw write would be truncated.
+    out, _, rc = run(["lsblk", "-b", "-d", "-n", "-o", "SIZE", target_device])
+    try:
+        target_bytes = int(out.strip()) if rc == 0 else 0
+    except ValueError:
+        target_bytes = 0
+    image_bytes = Path(image_path).stat().st_size
+    if target_bytes and image_bytes > target_bytes:
+        return jsonify({"error": f"Image ({_human_size(image_bytes)}) is larger than target device "
+                                 f"({_human_size(target_bytes)}). Refusing a truncated restore."}), 400
+    if not restore_job.start(_run_restore_thread, image_path, target_device):
+        return jsonify({"error": "Restore already running"}), 409
     return jsonify({"ok": True})
 
 @app.route("/api/restore/stream")
 def api_restore_stream():
-    def generate():
-        yield "data: {\"type\":\"connected\"}\n\n"
-        while True:
-            try:
-                msg = _restore_queue.get(timeout=30)
-                yield f"data: {json.dumps(msg)}\n\n"
-                if msg.get("type") == "done":
-                    break
-            except queue.Empty:
-                yield "data: {\"type\":\"ping\"}\n\n"
-    return Response(generate(), mimetype="text/event-stream",
-                    headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no"})
+    return restore_job.stream()
 
 @app.route("/api/restore/status")
 def api_restore_status():
-    return jsonify(_restore_status)
+    return jsonify(restore_job.status)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Frontend — single embedded HTML page
@@ -2098,7 +2157,14 @@ textarea{resize:vertical;line-height:1.6}
 
 /* Badge */
 .badge{padding:2px 8px;border-radius:4px;font-size:11px;font-weight:700;letter-spacing:.05em;border:1px solid;display:inline-flex;align-items:center;gap:5px;white-space:nowrap}
-.badge .dot{width:5px;height:5px;border-radius:50%}
+/* status dots render a glyph, so state is conveyed by shape as well as colour
+   (colourblind / screen-magnifier friendly; matches the ✓/✗/⚠ used in logs) */
+.badge .dot{width:auto;height:auto;border-radius:0;background:none!important;line-height:1}
+.badge.green .dot::before{content:"✓"}
+.badge.red .dot::before{content:"✗"}
+.badge.orange .dot::before{content:"⚠"}
+.badge.blue .dot::before{content:"ℹ"}
+.badge.muted .dot::before{content:"·"}
 .badge.green{background:rgba(16,185,129,.14);border-color:var(--green);color:var(--green)}
 .badge.green .dot{background:var(--green)}
 .badge.red{background:rgba(239,68,68,.14);border-color:var(--red);color:var(--red)}
@@ -2202,6 +2268,14 @@ textarea{resize:vertical;line-height:1.6}
   .ct-row{grid-template-columns:1fr 1fr;gap:4px;padding:10px 12px}
   .phase-bar{grid-template-columns:repeat(2,1fr)}
   .cl-row-wrap{flex-wrap:wrap}
+  .g-stack{grid-template-columns:1fr!important}
+  .target-item{flex-wrap:wrap}
+  .term-box{overflow-x:auto}
+}
+@media(max-width:420px){
+  .dest-grid{grid-template-columns:repeat(2,1fr)}
+  .day-btn{width:40px;height:40px}
+  .ct-row{grid-template-columns:1fr}
 }
 </style>
 </head>
@@ -2396,7 +2470,7 @@ textarea{resize:vertical;line-height:1.6}
       <div id="dep-banner-iscsi" style="display:none;padding:12px 16px;border-radius:8px;border:1px solid rgba(245,158,11,.35);background:rgba(245,158,11,.07);margin-bottom:12px"></div>
       <div class="sub-panel">
         <div class="row" style="margin-bottom:14px"><div class="step-circle" style="background:rgba(59,130,246,.2);border:1px solid var(--accent);color:var(--accent)">1</div><strong style="color:var(--bright);font-size:13px">Discover iSCSI Targets</strong></div>
-        <div style="display:grid;grid-template-columns:1fr 80px auto;gap:10px;align-items:end">
+        <div class="g-stack" style="display:grid;grid-template-columns:1fr 80px auto;gap:10px;align-items:end">
           <div class="field" style="margin:0"><div class="lbl">Portal IP</div><input type="text" id="iscsiPortal" placeholder="192.168.1.100" oninput="scheduleDiscover()"></div>
           <div class="field" style="margin:0"><div class="lbl">Port</div><input type="text" id="iscsiPort" value="3260" style="width:80px"></div>
           <button class="btn cyan" onclick="iscsiDiscover()"><span id="disc-sp" class="spinner" style="display:none"></span>🔍 Discover</button>
@@ -2488,7 +2562,7 @@ textarea{resize:vertical;line-height:1.6}
       <div id="dep-banner-nfs" style="display:none;padding:12px 16px;border-radius:8px;border:1px solid rgba(245,158,11,.35);background:rgba(245,158,11,.07);margin-bottom:12px"></div>
       <div class="sub-panel">
         <div class="row" style="margin-bottom:14px"><div class="step-circle" style="background:rgba(139,92,246,.2);border:1px solid var(--purple);color:var(--purple)">1</div><strong style="color:var(--bright);font-size:13px">NFS Server</strong></div>
-        <div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end">
+        <div class="g-stack" style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:end">
           <div class="field" style="margin:0"><div class="lbl">Server IP / Hostname</div><input type="text" id="nfsServer" placeholder="192.168.1.50" onblur="nfsScan()"></div>
           <button class="btn cyan" onclick="nfsScan()"><span id="nfs-scan-sp" class="spinner" style="display:none"></span>🔍 Scan Exports</button>
         </div>
@@ -2852,7 +2926,7 @@ textarea{resize:vertical;line-height:1.6}
         </div>
         <div class="row" style="gap:6px">
           <button class="btn ghost sm" onclick="copyLog('run-log')" title="Copy log">📋 Copy</button>
-          <button class="btn ghost sm" onclick="toggleExpandLog('run-log')" id="run-expand-btn" title="Expand">⛶</button>
+          <button class="btn ghost sm" onclick="toggleExpandLog('run-log')" id="run-expand-btn" title="Expand log" aria-label="Expand log">⛶</button>
         </div>
       </div>
       <div id="run-log" class="term-box" style="max-height:340px;overflow-y:auto"></div>
@@ -2899,7 +2973,7 @@ textarea{resize:vertical;line-height:1.6}
 
     <!-- Stats grid -->
     <div id="compact-stats" style="display:none;margin-bottom:14px;padding:12px 14px;background:var(--surface2);border-radius:8px;font-size:13px">
-      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
+      <div class="g-stack" style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">
         <div><div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em">Image (logical)</div><div id="cstat-logical" style="font-weight:600;margin-top:3px;font-size:15px">—</div></div>
         <div><div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em">Disk usage (actual)</div><div id="cstat-sparse" style="font-weight:600;margin-top:3px;font-size:15px">—</div></div>
         <div><div style="color:var(--muted);font-size:10px;text-transform:uppercase;letter-spacing:.07em">Source used</div><div id="cstat-source" style="font-weight:600;margin-top:3px;font-size:15px">—</div></div>
@@ -3010,7 +3084,8 @@ textarea{resize:vertical;line-height:1.6}
       <button class="btn cyan sm" onclick="scanRestoreDevices()"><span id="restore-scan-sp" class="spinner" style="display:none"></span>🔍 Scan Devices</button>
     </div>
     <div class="info orange" style="margin-bottom:14px;font-size:12px">
-      ⚠️ Only <strong>USB drives and SD card readers</strong> are shown as valid restore targets.
+      ⚠️ Only <strong>USB drives and SD card readers</strong> can be selected as restore targets.
+      The Pi's boot disk and fixed internal disks appear locked and cannot be chosen.
       Plug in your device first, then click <strong>Scan Devices</strong>.
       Double-check the size matches what you expect before selecting.
     </div>
@@ -3030,6 +3105,10 @@ textarea{resize:vertical;line-height:1.6}
         <div class="step-circle" style="background:rgba(239,68,68,.2);border:1px solid var(--red);color:var(--red)">3</div>
         <span style="color:var(--red)">Confirm — Read Carefully</span>
       </div>
+    </div>
+    <div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px">
+      <div style="font-size:11px;color:var(--muted);font-weight:700;letter-spacing:.08em;margin-bottom:8px">RESTORE SUMMARY</div>
+      <div id="restore-summary" style="font-size:12px;line-height:1.8;word-break:break-all"></div>
     </div>
     <div style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:14px;margin-bottom:16px">
       <div style="font-size:11px;color:var(--muted);font-weight:700;letter-spacing:.08em;margin-bottom:8px">COMMAND THAT WILL RUN</div>
@@ -3075,7 +3154,7 @@ textarea{resize:vertical;line-height:1.6}
   <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;width:min(600px,92vw);max-height:80vh;overflow-y:auto;animation:fadeIn .2s ease">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
       <div class="card-title"><span class="icon">📦</span> <span id="install-title">Installing…</span></div>
-      <button class="btn ghost sm" onclick="document.getElementById('install-modal').style.display='none'">✕</button>
+      <button class="btn ghost sm" onclick="document.getElementById('install-modal').style.display='none'" title="Close" aria-label="Close">✕</button>
     </div>
     <div id="install-log" class="term-box" style="max-height:340px;overflow-y:auto;margin-bottom:12px"></div>
     <div id="install-result" style="display:none"></div>
@@ -3087,7 +3166,7 @@ textarea{resize:vertical;line-height:1.6}
   <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;width:min(660px,92vw);max-height:82vh;overflow-y:auto;animation:fadeIn .2s ease">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
       <div class="card-title"><span class="icon">🕐</span> Last Backup Details</div>
-      <button class="btn ghost sm" onclick="document.getElementById('last-backup-modal').style.display='none'">✕</button>
+      <button class="btn ghost sm" onclick="document.getElementById('last-backup-modal').style.display='none'" title="Close" aria-label="Close">✕</button>
     </div>
     <div id="lbm-content"><div style="color:var(--muted);font-size:13px">Loading…</div></div>
   </div>
@@ -3098,10 +3177,10 @@ textarea{resize:vertical;line-height:1.6}
   <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;width:min(680px,92vw);max-height:85vh;overflow-y:auto;animation:fadeIn .2s ease">
     <div class="card-hdr" style="margin-bottom:16px">
       <div class="card-title"><span class="icon">📦</span> <span id="imgbak-modal-title">Installing image-backup…</span></div>
-      <button class="btn ghost sm" id="imgbak-modal-close" onclick="document.getElementById('imgbak-modal').style.display='none'" disabled>✕</button>
+      <button class="btn ghost sm" id="imgbak-modal-close" onclick="document.getElementById('imgbak-modal').style.display='none'" disabled title="Close" aria-label="Close">✕</button>
     </div>
     <!-- Step progress -->
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:16px">
+    <div class="phase-bar" style="margin-bottom:16px">
       <div class="phase-item"><div class="phase-track" id="ib-step1-track"></div><div class="phase-label" id="ib-step1-lbl">1. Git</div></div>
       <div class="phase-item"><div class="phase-track" id="ib-step2-track"></div><div class="phase-label" id="ib-step2-lbl">2. Clone / Pull</div></div>
       <div class="phase-item"><div class="phase-track" id="ib-step3-track"></div><div class="phase-label" id="ib-step3-lbl">3. Install</div></div>
@@ -3120,7 +3199,7 @@ textarea{resize:vertical;line-height:1.6}
   <div style="background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;width:min(420px,92vw);animation:fadeIn .2s ease">
     <div class="card-hdr">
       <div class="card-title"><span class="icon">🔑</span> Change Password</div>
-      <button class="btn ghost sm" onclick="document.getElementById('changepw-modal').style.display='none'">✕</button>
+      <button class="btn ghost sm" onclick="document.getElementById('changepw-modal').style.display='none'" title="Close" aria-label="Close">✕</button>
     </div>
     <div class="field">
       <div class="lbl">Current Password</div>
@@ -3280,21 +3359,45 @@ function termLine(msg, type="info") {
   return `<div class="term-line"><span class="term-prefix t-${type}">${pmap[type]||"›"}</span><span class="t-${type}">${esc(msg)}</span></div>`;
 }
 function esc(s) {
-  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+}
+const TERM_MAX_LINES = 1000;
+function trimTermBox(box) {
+  // Cap terminal DOM nodes so a multi-thousand-line stream can't bloat memory
+  while (box.children.length > TERM_MAX_LINES) box.removeChild(box.firstChild);
 }
 function appendLog(boxId, msg, type="info") {
-  const el = document.getElementById(boxId);
+  const el = $c(boxId);
   if (!el) return;
   el.style.display = "";
   const wrapper = document.createElement("div");
   wrapper.innerHTML = termLine(msg, type);
   el.appendChild(wrapper.firstChild);
+  trimTermBox(el);
   el.scrollTop = el.scrollHeight;
 }
 function clearLog(boxId) {
   const el = document.getElementById(boxId);
   if (el) { el.innerHTML = ""; el.style.display = "none"; }
 }
+const $ = id => document.getElementById(id);
+const _elCache = {};
+// Memoised lookup for STATIC nodes hit on every streamed log line
+// (phase bars, terminal boxes). Never use for re-rendered elements.
+const $c = id => _elCache[id] || (_elCache[id] = document.getElementById(id));
+// Delegated click handling for rows that are re-rendered on every scan/refresh
+// (replaces per-row inline onclick attributes)
+document.addEventListener("click", e => {
+  const el = e.target.closest("[data-action]");
+  if (!el) return;
+  switch (el.dataset.action) {
+    case "select-restore-dev": selectRestoreDevice(el.dataset.name, el.dataset.size, el.dataset.model); break;
+    case "select-nfs-export":  selectNfsExport(el, el.dataset.path); break;
+    case "select-usb-part":    selectUsbPart(el, el.dataset.dev, el.dataset.fstype); break;
+    case "toggle-ct":          toggleCtField(el); break;
+    case "open-install-modal": openInstallModal(JSON.parse(el.dataset.pkgs)); break;
+  }
+});
 function _copyText(text) {
   if (navigator.clipboard) {
     navigator.clipboard.writeText(text)
@@ -3536,9 +3639,9 @@ async function checkMountStatus(dest) {
     S.mountStates[dest] = true;
 
     if (matches && banner) {
-      const src = d.source ? ` <span style="color:var(--muted)">(${d.source})</span>` : "";
-      const df  = d.df     ? ` — ${d.df.trim()}`                                      : "";
-      banner.innerHTML = `<div class="info green">✅ Already mounted at <strong>${mp}</strong>${src}${df} — this destination is active.</div>`;
+      const src = d.source ? ` <span style="color:var(--muted)">(${esc(d.source)})</span>` : "";
+      const df  = d.df     ? ` — ${esc(d.df.trim())}`                                       : "";
+      banner.innerHTML = `<div class="info green">✅ Already mounted at <strong>${esc(mp)}</strong>${src}${df} — this destination is active.</div>`;
       banner.style.display = "";
     }
   } catch(e) {}
@@ -3564,8 +3667,8 @@ async function checkMountStatus(dest) {
         if (devEl && !devEl.value && s0.device) {
           devEl.value = s0.device;
         }
-        const devInfo = s0.device ? ` → <strong style="color:var(--green)">${s0.device}</strong>` : "";
-        sb.innerHTML = `<div class="info blue">🔌 ${d.count} active iSCSI session${d.count>1?"s":""}: <strong>${s0.iqn}</strong> @ ${s0.portal}${devInfo}</div>`;
+        const devInfo = s0.device ? ` → <strong style="color:var(--green)">${esc(s0.device)}</strong>` : "";
+        sb.innerHTML = `<div class="info blue">🔌 ${d.count} active iSCSI session${d.count>1?"s":""}: <strong>${esc(s0.iqn)}</strong> @ ${esc(s0.portal)}${devInfo}</div>`;
         sb.style.display = "";
       } else {
         sb.style.display = "none";
@@ -3752,7 +3855,7 @@ function renderNfsExports(exports) {
   wrap.innerHTML = `<div class="lbl" style="margin-bottom:8px">Available Exports</div>` +
     exports.map(ex => {
       const path = ex.split(" ")[0];
-      return `<div class="target-item" onclick="selectNfsExport(this,'${path}')"
+      return `<div class="target-item" data-action="select-nfs-export" data-path="${esc(path)}"
         style="border-color:var(--border)">
         <div class="radio-outer"><div class="radio-inner"></div></div>
         <span style="font-size:12px;font-family:monospace;color:var(--text)">${esc(ex)}</span>
@@ -3791,7 +3894,7 @@ function renderUsbDevices(devices) {
   list.innerHTML = devices.map(disk => {
     const parts = (disk.children || []).filter(c => c.type === "part");
     const partsHtml = parts.map(p => `
-      <div onclick="selectUsbPart(this,'/dev/${p.name}','${p.fstype||'ext4'}')"
+      <div data-action="select-usb-part" data-dev="/dev/${esc(p.name)}" data-fstype="${esc(p.fstype||'ext4')}"
         style="display:flex;align-items:center;gap:10px;padding:10px 14px;cursor:pointer;background:var(--bg4);border:1px solid var(--border);border-radius:0 0 8px 8px;transition:all .15s">
         <div style="width:12px;height:12px;border-radius:50%;border:2px solid var(--muted);flex-shrink:0"></div>
         <span style="font-size:14px">${FS_ICONS[p.fstype]||"💿"}</span>
@@ -3812,7 +3915,7 @@ function renderUsbDevices(devices) {
   }).join("");
 }
 function selectUsbPart(el, dev, fstype) {
-  document.querySelectorAll("#usb-list [onclick]").forEach(x => {
+  document.querySelectorAll("#usb-list [data-action]").forEach(x => {
     x.style.background = "var(--bg4)"; x.style.borderColor = "var(--border)";
     const r = x.querySelector("[style*='border-radius:50%']");
     if (r) { r.style.borderColor = "var(--muted)"; r.innerHTML = ""; }
@@ -3901,11 +4004,11 @@ function renderContainers() {
     row.innerHTML = `
       <div><div class="ct-name">${esc(c.name)}</div><div class="ct-img">${esc(c.image)}</div></div>
       <div><span class="badge ${run?"green":"muted"}"><span class="dot"></span>${esc(c.status)}</span></div>
-      <div><div class="toggle ${cc.stopOnBackup?"on":"off"}" data-id="${c.id}" data-field="stopOnBackup" onclick="toggleCtField(this)"><div class="toggle-k"></div></div></div>
-      <div><div class="toggle ${cc.restartAfter?"on":"off"}" data-id="${c.id}" data-field="restartAfter" onclick="toggleCtField(this)"><div class="toggle-k"></div></div></div>
+      <div><div class="toggle ${cc.stopOnBackup?"on":"off"}" data-action="toggle-ct" data-id="${esc(c.id)}" data-field="stopOnBackup"><div class="toggle-k"></div></div></div>
+      <div><div class="toggle ${cc.restartAfter?"on":"off"}" data-action="toggle-ct" data-id="${esc(c.id)}" data-field="restartAfter"><div class="toggle-k"></div></div></div>
       <div>
-        <select class="pri-select" style="color:${PRI_COLORS[cc.priority]||"var(--text)"};border-color:${PRI_COLORS[cc.priority]}44"
-          onchange="setPriority('${c.id}',this)">
+        <select class="pri-select" data-id="${esc(c.id)}" style="color:${PRI_COLORS[cc.priority]||"var(--text)"};border-color:${PRI_COLORS[cc.priority]}44"
+          onchange="setPriority(this.dataset.id,this)">
           <option value="foundation" ${cc.priority==="foundation"?"selected":""}>🟠 Foundation</option>
           <option value="high"       ${cc.priority==="high"      ?"selected":""}>🔵 High</option>
           <option value="normal"     ${cc.priority==="normal"    ?"selected":""}>⚪ Normal</option>
@@ -4591,13 +4694,13 @@ function updatePhase(phase) {
   for (let i = 0; i < 4; i++) {
     const done = phase > i;
     const active = phase === i;
-    document.getElementById("ph"+i).style.background  = (done||active) ? colors[i] : "var(--border)";
-    document.getElementById("phl"+i).style.color = (done||active) ? colors[i] : "var(--muted)";
-    document.getElementById("phl"+i).style.fontWeight = (done||active) ? "700" : "400";
+    $c("ph"+i).style.background  = (done||active) ? colors[i] : "var(--border)";
+    $c("phl"+i).style.color = (done||active) ? colors[i] : "var(--muted)";
+    $c("phl"+i).style.fontWeight = (done||active) ? "700" : "400";
   }
-  const lbl = document.getElementById("phase-lbl");
-  const dot = document.getElementById("phase-dot");
-  const pst = document.getElementById("phase-status");
+  const lbl = $c("phase-lbl");
+  const dot = $c("phase-dot");
+  const pst = $c("phase-status");
   if (phase >= 0 && phase < 4) {
     pst.style.display = "";
     lbl.textContent = labels[phase];
@@ -4608,10 +4711,11 @@ function updatePhase(phase) {
 }
 
 function appendRunLog(msg, type) {
-  const box = document.getElementById("run-log");
+  const box = $c("run-log");
   const wrapper = document.createElement("div");
   wrapper.innerHTML = termLine(msg, type);
   box.appendChild(wrapper.firstChild);
+  trimTermBox(box);
   box.scrollTop = box.scrollHeight;
 }
 
@@ -4774,13 +4878,14 @@ function openImgbakModal(update) {
 }
 
 function appendImgbakLog(msg, level) {
-  const box = document.getElementById("imgbak-log");
+  const box = $c("imgbak-log");
   const cls = level === "cmd" ? "t-cmd" : level === "ok" ? "t-ok" : level === "err" ? "t-err" : level === "warn" ? "t-warn" : "t-info";
   const prefix = level === "cmd" ? "$" : level === "ok" ? "✓" : level === "err" ? "✗" : level === "warn" ? "!" : " ";
   const el = document.createElement("div");
   el.className = "term-line";
-  el.innerHTML = `<span class="term-prefix ${cls}">${prefix}</span><span class="${cls}">${msg.replace(/</g,"&lt;")}</span>`;
+  el.innerHTML = `<span class="term-prefix ${cls}">${prefix}</span><span class="${cls}">${esc(msg)}</span>`;
   box.appendChild(el);
+  trimTermBox(box);
   box.scrollTop = box.scrollHeight;
 }
 
@@ -4793,8 +4898,8 @@ function updateImgbakSteps(msg) {
   ];
   steps.forEach(([id, keywords]) => {
     if (keywords.some(k => msg.includes(k))) {
-      document.getElementById(id+"-track").style.background = "var(--accent)";
-      document.getElementById(id+"-lbl").style.color = "var(--accent)";
+      $c(id+"-track").style.background = "var(--accent)";
+      $c(id+"-lbl").style.color = "var(--accent)";
     }
   });
 }
@@ -4802,8 +4907,8 @@ function updateImgbakSteps(msg) {
 function finishImgbak(result) {
   const success = result === "success";
   ["ib-step1","ib-step2","ib-step3","ib-step4"].forEach(id => {
-    document.getElementById(id+"-track").style.background = success ? "var(--green)" : "var(--red)";
-    document.getElementById(id+"-lbl").style.color        = success ? "var(--green)" : "var(--red)";
+    $c(id+"-track").style.background = success ? "var(--green)" : "var(--red)";
+    $c(id+"-lbl").style.color        = success ? "var(--green)" : "var(--red)";
   });
   const res = document.getElementById("imgbak-result");
   res.innerHTML = success
@@ -4841,7 +4946,7 @@ function checkDestDeps(destType) {
         </div>
       </div>
       <button class="btn sm" style="background:rgba(245,158,11,.15);color:var(--orange);border-color:rgba(245,158,11,.6);white-space:nowrap"
-        onclick='openInstallModal(${JSON.stringify(pkgs)})'>📦 Install now</button>
+        data-action="open-install-modal" data-pkgs="${esc(JSON.stringify(pkgs))}">📦 Install now</button>
     </div>`;
 }
 
@@ -5165,11 +5270,11 @@ function showLastBackupModal() {
     const ok = d.result === "success";
     const cls = d.result === "success" ? "green" : d.result === "failed" ? "red" : "muted";
     let html = `<div class="g2" style="margin-bottom:18px">`;
-    html += `<div><div class="lbl">Result</div><div style="margin-top:6px"><span class="badge ${cls}"><span class="dot"></span>${d.result || "Unknown"}</span></div></div>`;
-    if (d.elapsed) html += `<div><div class="lbl">Duration</div><div style="margin-top:6px;color:var(--bright);font-size:13px;font-weight:600">${d.elapsed}</div></div>`;
+    html += `<div><div class="lbl">Result</div><div style="margin-top:6px"><span class="badge ${cls}"><span class="dot"></span>${esc(d.result || "Unknown")}</span></div></div>`;
+    if (d.elapsed) html += `<div><div class="lbl">Duration</div><div style="margin-top:6px;color:var(--bright);font-size:13px;font-weight:600">${esc(d.elapsed)}</div></div>`;
     html += `</div>`;
-    if (d.started)  html += `<div class="field"><div class="lbl">Started</div><div style="color:var(--text);font-size:12px;margin-top:4px">${d.started}</div></div>`;
-    if (d.finished) html += `<div class="field"><div class="lbl">Finished</div><div style="color:var(--text);font-size:12px;margin-top:4px">${d.finished}</div></div>`;
+    if (d.started)  html += `<div class="field"><div class="lbl">Started</div><div style="color:var(--text);font-size:12px;margin-top:4px">${esc(d.started)}</div></div>`;
+    if (d.finished) html += `<div class="field"><div class="lbl">Finished</div><div style="color:var(--text);font-size:12px;margin-top:4px">${esc(d.finished)}</div></div>`;
     if (d.log_lines && d.log_lines.length) {
       html += `<div class="lbl" style="margin-bottom:8px;margin-top:4px">Log</div><div class="term-box" style="max-height:320px;overflow-y:auto">`;
       for (const line of d.log_lines) {
@@ -5252,7 +5357,8 @@ function nextCronRun(expr) {
   } catch { return "—"; }
 }
 
-let _dbTimer = null;
+let _dbTimer = null;   // 1s elapsed-time ticker (display only)
+let _dbPoll  = null;   // ~3s data refresh, active ONLY while a backup runs
 function parseElapsedSecs(s) {
   let secs = 0;
   const h = s.match(/(\d+)h/); if (h) secs += parseInt(h[1]) * 3600;
@@ -5268,6 +5374,13 @@ async function loadDashboard() {
   try {
     const r = await fetch("/api/dashboard");
     const d = await r.json();
+
+    // Auto-refresh while a backup is running; an idle page makes zero requests
+    if (d.running && !_dbPoll) {
+      _dbPoll = setInterval(loadDashboard, 3000);
+    } else if (!d.running && _dbPoll) {
+      clearInterval(_dbPoll); _dbPoll = null;
+    }
 
     // ── Last backup ───────────────────────────────────────────────────────────
     const last = d.last || {};
@@ -5368,12 +5481,19 @@ async function loadDashboard() {
     document.getElementById("db-refresh-ts").textContent =
       "Last refreshed " + new Date().toLocaleTimeString(undefined, {hour:"2-digit",minute:"2-digit",second:"2-digit"});
 
-  } catch(e) { toast("Dashboard load failed: " + e.message, "err"); }
+  } catch(e) {
+    if (_dbPoll) { clearInterval(_dbPoll); _dbPoll = null; }  // no toast spam while polling
+    toast("Dashboard load failed: " + e.message, "err");
+  }
 }
 
 // ─── Restore tab ──────────────────────────────────────────────────────────────
 let restoreSelectedDevice = null;
 let restoreImageVerified  = false;
+let restoreImageInfo      = null;   // {path, sizeBytes, sizeGb} from /api/restore/verify
+let restoreDevices        = [];     // last /api/restore/devices scan
+let restoreBootDevice     = "";     // e.g. /dev/mmcblk0
+let restoreFitOk          = true;   // image size <= target size
 
 // Auto-fill image path + check mount when restore tab is first shown
 document.querySelector('.tab-btn[data-tab="restore"]').addEventListener("click", () => {
@@ -5460,7 +5580,7 @@ async function restoreSourceMount() {
   const appendLog = (msg, cls) => {
     const el = document.createElement("div");
     el.className = "term-line";
-    el.innerHTML = `<span class="term-prefix ${cls}"></span><span class="${cls}">${msg.replace(/</g,"&lt;")}</span>`;
+    el.innerHTML = `<span class="term-prefix ${cls}"></span><span class="${cls}">${esc(msg)}</span>`;
     log.appendChild(el);
     log.scrollTop = log.scrollHeight;
   };
@@ -5487,15 +5607,15 @@ async function restoreSourceUnmount() {
   const mp = getMountPoint() || "/mnt/backups";
   const log = document.getElementById("restore-src-log");
   log.style.display = "";
-  log.innerHTML = `<div class="term-line"><span class="t-cmd">Unmounting ${mp}…</span></div>`;
+  log.innerHTML = `<div class="term-line"><span class="t-cmd">Unmounting ${esc(mp)}…</span></div>`;
   try {
     const r = await fetch("/api/mount/do", { method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify({action:"unmount", mountPoint:mp}) });
     const d = await r.json();
-    log.innerHTML += `<div class="term-line"><span class="${d.ok ? "t-ok" : "t-err"}">${d.ok ? "Unmounted OK" : d.error}</span></div>`;
+    log.innerHTML += `<div class="term-line"><span class="${d.ok ? "t-ok" : "t-err"}">${d.ok ? "Unmounted OK" : esc(d.error)}</span></div>`;
     setTimeout(checkRestoreSourceMount, 500);
   } catch(e) {
-    log.innerHTML += `<div class="term-line"><span class="t-err">${e.message}</span></div>`;
+    log.innerHTML += `<div class="term-line"><span class="t-err">${esc(e.message)}</span></div>`;
   }
 }
 
@@ -5504,19 +5624,21 @@ async function verifyRestoreImage() {
   const status = document.getElementById("restore-img-status");
   spin("restore-verify-sp", true);
   restoreImageVerified = false;
+  restoreImageInfo = null;
   updateRestoreConfirm();
   try {
     const r = await fetch("/api/restore/verify", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({imagePath: path}) });
     const d = await r.json();
     if (d.ok) {
-      status.innerHTML = `<div class="info green">✅ Image found: <strong>${d.path}</strong> — ${d.sizeGb} GB</div>`;
+      status.innerHTML = `<div class="info green">✅ Image found: <strong>${esc(d.path)}</strong> — ${esc(d.sizeGb)} GB</div>`;
       restoreImageVerified = true;
+      restoreImageInfo = d;
     } else {
-      status.innerHTML = `<div class="info red">❌ ${d.error}</div>`;
+      status.innerHTML = `<div class="info red">❌ ${esc(d.error)}</div>`;
     }
     status.style.display = "";
   } catch(e) {
-    status.innerHTML = `<div class="info red">Request failed: ${e.message}</div>`;
+    status.innerHTML = `<div class="info red">Request failed: ${esc(e.message)}</div>`;
     status.style.display = "";
   }
   spin("restore-verify-sp", false);
@@ -5533,7 +5655,7 @@ async function scanRestoreDevices() {
     const d = await r.json();
     renderRestoreDevices(d.devices, d.bootDevice);
   } catch(e) {
-    document.getElementById("restore-dev-list").innerHTML = `<div class="info red">Scan failed: ${e.message}</div>`;
+    document.getElementById("restore-dev-list").innerHTML = `<div class="info red">Scan failed: ${esc(e.message)}</div>`;
   }
   spin("restore-scan-sp", false);
 }
@@ -5541,34 +5663,56 @@ async function scanRestoreDevices() {
 function renderRestoreDevices(devices, bootDevice) {
   const list  = document.getElementById("restore-dev-list");
   const empty = document.getElementById("restore-dev-empty");
+  restoreDevices    = devices;
+  restoreBootDevice = bootDevice;
 
-  // Only show USB/removable devices — never show boot device or fixed internal disks
+  // Selectable: USB/removable devices only. The boot disk and fixed internal
+  // disks are still rendered, but greyed out and unclickable, so it's obvious
+  // why they can't be picked.
   const usable = devices.filter(dev => !dev.isBootDevice && (dev.hotplug || dev.tran === "usb"));
+  const locked = devices.filter(dev => !usable.includes(dev));
 
   if (!usable.length) {
     empty.textContent = devices.length
       ? "No USB drives or SD card readers detected. Plug in your device and scan again."
       : "No devices found. Plug in your USB drive or SD card reader, then scan again.";
     empty.style.display = "";
-    list.innerHTML = "";
-    return;
+  } else {
+    empty.style.display = "none";
   }
-  empty.style.display = "none";
-  list.innerHTML = usable.map(dev => {
+
+  const usableRows = usable.map(dev => {
     const icon = "💾";
-    return `<div class="target-item" id="rdev-${dev.name.replace('/dev/','')}" onclick="selectRestoreDevice('${dev.name}','${dev.size}','${dev.model||""}')">
+    return `<div class="target-item" id="rdev-${esc(dev.name.replace('/dev/',''))}" data-action="select-restore-dev" data-name="${esc(dev.name)}" data-size="${esc(dev.size)}" data-model="${esc(dev.model||"")}">
       <div class="radio-outer"><div class="radio-inner"></div></div>
       <span style="font-size:18px">${icon}</span>
       <div style="flex:1">
-        <div style="font-size:13px;color:var(--bright);font-weight:600">${dev.name}</div>
-        <div style="font-size:11px;color:var(--muted)">${dev.size} · ${dev.model||"USB Device"} · USB / Removable</div>
+        <div style="font-size:13px;color:var(--bright);font-weight:600">${esc(dev.name)}</div>
+        <div style="font-size:11px;color:var(--muted)">${esc(dev.size)} · ${esc(dev.model||"USB Device")} · USB / Removable</div>
       </div>
       <span class="badge blue">Removable</span>
     </div>`;
-  }).join("");
+  });
+  const lockedRows = locked.map(dev => {
+    const boot  = dev.isBootDevice;
+    const title = boot ? "This is the disk the Pi is running from — it can never be a restore target"
+                       : "Fixed internal disk — only removable USB devices can be restore targets";
+    return `<div class="target-item" aria-disabled="true" title="${esc(title)}" style="opacity:.45;cursor:not-allowed">
+      <div class="radio-outer" style="visibility:hidden"><div class="radio-inner"></div></div>
+      <span style="font-size:18px">${boot ? "🛡️" : "🔒"}</span>
+      <div style="flex:1">
+        <div style="font-size:13px;color:var(--muted);font-weight:600">${esc(dev.name)}</div>
+        <div style="font-size:11px;color:var(--muted)">${esc(dev.size)} · ${esc(dev.model||"Disk")}</div>
+      </div>
+      <span class="badge ${boot ? "red" : "muted"}">${boot ? "Boot disk — protected" : "Not removable"}</span>
+    </div>`;
+  });
+  list.innerHTML = usableRows.concat(lockedRows).join("");
 }
 
 function selectRestoreDevice(name, size, model) {
+  const dev = restoreDevices.find(d => d.name === name);
+  if (dev && dev.isBootDevice) { toast("That is the boot disk — it cannot be a restore target", "err"); return; }
   restoreSelectedDevice = name;
   document.getElementById("restoreTargetDevice").value = name;
   document.querySelectorAll("#restore-dev-list .target-item").forEach(el => el.classList.remove("active"));
@@ -5583,10 +5727,10 @@ function updateRestoreConfirm() {
   const chk2 = document.getElementById("restore-chk2");
   if (restoreImageVerified && restoreSelectedDevice) {
     const imgPath = document.getElementById("restoreImagePath").value.trim();
-    const tool    = "image-restore OR dd (auto-detected at runtime)";
     document.getElementById("restore-cmd-preview").textContent =
       `sudo image-restore ${imgPath} ${restoreSelectedDevice}\n# — or if image-restore unavailable —\nsudo dd if=${imgPath} of=${restoreSelectedDevice} bs=4M status=progress conv=fsync`;
     document.getElementById("restore-chk1-dev").textContent = restoreSelectedDevice;
+    renderRestoreSummary(imgPath);
     chk1.checked = false;
     chk2.checked = false;
     card.style.display = "";
@@ -5596,11 +5740,33 @@ function updateRestoreConfirm() {
   updateRestoreStartBtn();
 }
 
+function renderRestoreSummary(imgPath) {
+  const box = document.getElementById("restore-summary");
+  const gb  = b => (b / 1073741824).toFixed(2) + " GB";
+  const dev = restoreDevices.find(d => d.name === restoreSelectedDevice);
+  const imgBytes = restoreImageInfo ? (restoreImageInfo.sizeBytes || 0) : 0;
+  const devBytes = dev ? (dev.sizeBytes || 0) : 0;
+  restoreFitOk = !(imgBytes && devBytes && imgBytes > devBytes);
+
+  let fitLine;
+  if (!imgBytes || !devBytes) {
+    fitLine = `<span class="t-warn">⚠ Could not compare image and device sizes — double-check manually before continuing</span>`;
+  } else if (restoreFitOk) {
+    fitLine = `<span class="t-ok">✓ Image fits on target — ${esc(gb(devBytes - imgBytes))} headroom remains</span>`;
+  } else {
+    fitLine = `<span class="t-err">✗ Image (${esc(gb(imgBytes))}) is LARGER than the target (${esc(gb(devBytes))}) — restore is blocked</span>`;
+  }
+  box.innerHTML =
+    `<div><span style="color:var(--muted)">Image source&nbsp;:</span> ${esc(imgPath)}${imgBytes ? ` — <strong>${esc(gb(imgBytes))}</strong>` : ""}</div>
+     <div><span style="color:var(--muted)">Target device:</span> ${esc(restoreSelectedDevice)}${dev ? ` — <strong>${esc(dev.size)}</strong> · ${esc(dev.model || "USB Device")}` : ""}</div>
+     <div>${fitLine}</div>`;
+}
+
 function updateRestoreStartBtn() {
   const chk1 = document.getElementById("restore-chk1");
   const chk2 = document.getElementById("restore-chk2");
   const btn  = document.getElementById("restore-start-btn");
-  if (btn) btn.disabled = !(chk1?.checked && chk2?.checked);
+  if (btn) btn.disabled = !(restoreFitOk && chk1?.checked && chk2?.checked);
 }
 document.addEventListener("change", e => {
   if (e.target.id === "restore-chk1" || e.target.id === "restore-chk2") updateRestoreStartBtn();
@@ -5610,6 +5776,11 @@ async function startRestore() {
   const imagePath    = document.getElementById("restoreImagePath").value.trim();
   const targetDevice = document.getElementById("restoreTargetDevice").value.trim();
   if (!imagePath || !targetDevice) { toast("Image path and target device required", "err"); return; }
+  const tgtDev = restoreDevices.find(d => d.name === targetDevice);
+  if ((tgtDev && tgtDev.isBootDevice) || (restoreBootDevice && targetDevice === restoreBootDevice)) {
+    toast(`Refusing: ${targetDevice} is the boot disk`, "err"); return;
+  }
+  if (!restoreFitOk) { toast("Image is larger than the target device — restore blocked", "err"); return; }
 
   // Show output card, reset log
   const outCard = document.getElementById("restore-output-card");
@@ -5648,13 +5819,14 @@ async function startRestore() {
 }
 
 function appendRestoreLog(msg, level) {
-  const box = document.getElementById("restore-log");
+  const box = $c("restore-log");
   const cls = level === "cmd" ? "t-cmd" : level === "ok" ? "t-ok" : level === "err" ? "t-err" : level === "warn" ? "t-warn" : "t-info";
   const pre = level === "cmd" ? "$" : level === "ok" ? "✓" : level === "err" ? "✗" : level === "warn" ? "⚠" : " ";
   const el  = document.createElement("div");
   el.className = "term-line";
-  el.innerHTML = `<span class="term-prefix ${cls}">${pre}</span><span class="${cls}">${msg.replace(/</g,"&lt;")}</span>`;
+  el.innerHTML = `<span class="term-prefix ${cls}">${pre}</span><span class="${cls}">${esc(msg)}</span>`;
   box.appendChild(el);
+  trimTermBox(box);
   box.scrollTop = box.scrollHeight;
 }
 
@@ -5667,8 +5839,8 @@ function updateRestorePhases(msg) {
   ];
   phases.forEach(([id, kws]) => {
     if (kws.some(k => msg.includes(k))) {
-      document.getElementById(id).style.background = "var(--accent)";
-      document.getElementById(id.replace("rph","rphl")).style.color = "var(--accent)";
+      $c(id).style.background = "var(--accent)";
+      $c(id.replace("rph","rphl")).style.color = "var(--accent)";
     }
   });
 }
@@ -5677,8 +5849,8 @@ function finishRestore(result) {
   const success = result === "success";
   const color   = success ? "var(--green)" : "var(--red)";
   ["rph0","rph1","rph2","rph3"].forEach(id => {
-    document.getElementById(id).style.background = color;
-    document.getElementById(id.replace("rph","rphl")).style.color = color;
+    $c(id).style.background = color;
+    $c(id.replace("rph","rphl")).style.color = color;
   });
   const box = document.getElementById("restore-result-box");
   box.innerHTML = success
