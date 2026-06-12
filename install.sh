@@ -182,9 +182,9 @@ step "Checking for Runtipi…"
 if [[ -f "$HOME/runtipi/runtipi-cli" ]]; then
     info "Runtipi found at $HOME/runtipi."
 else
-    warn "Runtipi not found at $HOME/runtipi."
-    warn "If you use Runtipi, install it first: https://runtipi.io/docs/getting-started/installation"
-    warn "Then update the Runtipi Directory in the backup manager settings."
+    info "Runtipi not found at $HOME/runtipi — that's fine, it's optional."
+    info "The backup script skips all container stop/start steps on hosts without Docker/Runtipi."
+    info "If you use Runtipi at another path, update the Runtipi Directory in the Config tab."
 fi
 
 # ── Docker group ──────────────────────────────────────────────────────────────

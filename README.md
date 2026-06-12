@@ -1,6 +1,6 @@
 # SpareCard
 
-Keep a bootable spare of your Raspberry Pi — a web-based image backup manager for Runtipi + Raspbian setups. *(Formerly "Pi Backup Manager".)*
+Keep a bootable spare of your Raspberry Pi — a web-based image backup manager for any Pi, with first-class Runtipi/Docker awareness. *(Formerly "Pi Backup Manager".)*
 
 ![Destination](screenshots/destination.png)
 
@@ -8,7 +8,7 @@ Keep a bootable spare of your Raspberry Pi — a web-based image backup manager 
 
 ## What is this?
 
-SpareCard is a self-hosted web UI that automates full image backups of your Raspberry Pi's boot device — SD card, USB SSD, NVMe, or any other block device — using [RonR's image-backup tools](https://github.com/seamusdemora/RonR-RPi-image-utils). It's the backup GUI that Runtipi doesn't have built-in.
+SpareCard is a self-hosted web UI that automates full image backups of your Raspberry Pi's boot device — SD card, USB SSD, NVMe, or any other block device — using [RonR's image-backup tools](https://github.com/seamusdemora/RonR-RPi-image-utils). If the Pi runs Runtipi it's the backup GUI Runtipi doesn't have built-in — containers are stopped and restarted around the backup in the right order. On a Pi without Docker or Runtipi, the container steps are skipped automatically and it's simply a clean image-backup GUI.
 
 You configure your backup destination, schedule, and notification settings through the browser. The app generates and installs a shell script that runs on cron — stopping your containers, backing up the image incrementally, restarting everything, and notifying you when done.
 
@@ -22,7 +22,7 @@ You configure your backup destination, schedule, and notification settings throu
 - Full Pi image backup via RonR image-backup (incremental after first run)
 - Multi-destination support: iSCSI, USB, SMB, NFS
 - Secondary destinations via rsync after primary backup
-- Runtipi-aware: stops and restarts Docker containers in the correct order
+- Runtipi-aware: stops and restarts Docker containers in the correct order — skipped automatically on hosts without Docker/Runtipi
 - Runtipi API fallback: restarts app containers that need network recreation
 - Guided image-backup install from GitHub (no manual steps)
 - Restore tab with USB/SD safety checks
@@ -124,6 +124,8 @@ When Runtipi is configured, the generated script:
 
 Enter your Runtipi username and password in the **Config** tab to enable the API fallback. The API URL is auto-detected from the running container — use the **Test Runtipi API** button to verify credentials before generating the script.
 
+The script detects its environment at runtime: on a host without Docker the container stop/start steps are skipped entirely, and without a `runtipi-cli` in the Runtipi directory the Runtipi-specific steps (CLI stop/start, health wait, reverse-proxy check, API login) are skipped — no spurious `docker: command not found` noise in the log.
+
 ---
 
 ## Configuration
@@ -176,6 +178,7 @@ All notable changes are documented here. This is the single source of truth for 
 - **Stalled commands returned an HTML 500** — `subprocess.TimeoutExpired` was uncaught in `run()`, so a hung command crashed the request handler and the browser got Flask's HTML error page (surfacing as "unexpected token '<' … is not valid JSON"). Timeouts now return rc 124 with a clear message.
 
 #### Changed
+- **Docker/Runtipi now truly optional** — the generated backup script detects its environment at runtime (`HAS_DOCKER`/`HAS_TIPI`): hosts without Docker skip the container snapshot/stop/restart steps entirely, and hosts without `runtipi-cli` skip the Runtipi CLI/health-wait/reverse-proxy/API steps. Backup logs on a plain Pi are now clean instead of full of `docker: command not found` and `cd: /home/<user>/runtipi: No such file or directory` noise. The installer's "Runtipi not found" message is informational now, and the README no longer positions Runtipi as a prerequisite.
 - **Rebrand internals (easy half)** — systemd unit, install dir, and sudoers file renamed to `sparecard` (`sparecard.service`, `~/sparecard`, `/etc/sudoers.d/sparecard`). Re-running `install.sh` on an existing install migrates automatically: the old `pi-backup-manager` unit is stopped and removed along with its sudoers entry. Config/auth paths, `PBM_*` env vars, the `~/.pbm` log dir, and the `X-PBM-CSRF` header deliberately keep their old names — renaming them would need permanent compatibility shims for no user-visible gain.
 
 ---

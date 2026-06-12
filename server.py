@@ -4415,6 +4415,7 @@ fi`;
   // Build the restart block as a reusable string (called on both success and failure)
   const restartBlock = `
   ${foundations.length ? `docker start ${foundations.map(x=>x.name).join(" ")} 2>&1 | sed "s/^/$(date): /"\n  sleep 20` : ""}
+  if [ "$HAS_TIPI" -eq 1 ]; then
   cd "$TIPI_DIR" && sudo ./runtipi-cli start || echo "$(date): WARNING - runtipi-cli start returned non-zero (containers may still be coming up)"
   HEALTH_WAIT=0
   until [ "$(docker inspect -f '{{.State.Health.Status}}' runtipi 2>/dev/null)" == "healthy" ]; do
@@ -4432,6 +4433,7 @@ fi`;
   fi
   sleep 5
   ${tipiCreds ? 'runtipi_login || true' : ''}
+  fi
   ${others.length ? others.map(x =>
     `smart_start ${x.name}`
   ).join("\n  ") : ""}
@@ -4454,6 +4456,10 @@ ${tipiCreds ? `TIPI_USER="${c.tipiUser}"
 TIPI_PASS="${c.tipiPass}"` : `TIPI_USER=""
 TIPI_PASS=""`}
 ${ntfy ? `NTFY_URL="${c.ntfyServer||"https://ntfy.sh"}/${c.ntfyTopic||"my_backup"}"` : ""}
+
+# ── Environment detection — hosts without Docker/Runtipi skip container steps ──
+HAS_DOCKER=0; command -v docker >/dev/null 2>&1 && HAS_DOCKER=1
+HAS_TIPI=0;   [ -x "$TIPI_DIR/runtipi-cli" ] && HAS_TIPI=1
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 [ -f "$CRON_LOG" ] && LINES=$(wc -l < "$CRON_LOG") && [ "$LINES" -gt "$MAX_LOG_LINES" ] && \\
@@ -4581,6 +4587,10 @@ smart_start() {
 }
 
 restart_containers() {
+  if [ "$HAS_DOCKER" -eq 0 ]; then
+    echo "$(date): Docker not installed — no containers to restart."
+    return 0
+  fi
   echo "$(date): ── Restarting all services ──────────────────────────────────────────"
   ${restartBlock}
   echo "$(date): ── Services restart complete ─────────────────────────────────────────"
@@ -4703,15 +4713,24 @@ fi
 ${ntfy && c.notifyStart ? `send_simple_notification "Pi Backup Started" "default" "hourglass_flowing_sand" "Backup started at $(date)"` : ""}
 
 # ── Step 1: Snapshot ──────────────────────────────────────────────────────────
-PRE_BACKUP_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -v '^runtipi$')
-echo "$(date): Running: $(echo "$PRE_BACKUP_CONTAINERS" | tr '\\n' ' ')"
+PRE_BACKUP_CONTAINERS=""
+if [ "$HAS_DOCKER" -eq 1 ]; then
+  PRE_BACKUP_CONTAINERS=$(docker ps --format '{{.Names}}' | grep -v '^runtipi$')
+  echo "$(date): Running: $(echo "$PRE_BACKUP_CONTAINERS" | tr '\\n' ' ')"
+else
+  echo "$(date): Docker not installed — skipping container stop/start."
+fi
 
 # ── Step 2: Stop ──────────────────────────────────────────────────────────────
-cd "$TIPI_DIR" && sudo ./runtipi-cli stop || echo "$(date): WARNING - runtipi-cli stop failed."
+if [ "$HAS_TIPI" -eq 1 ]; then
+  cd "$TIPI_DIR" && sudo ./runtipi-cli stop || echo "$(date): WARNING - runtipi-cli stop failed."
+fi
 
 # ── Step 3: Settle ────────────────────────────────────────────────────────────
-docker ps -q | xargs -r docker stop 2>&1 | sed "s/^/$(date): /"
-CONTAINERS_STOPPED=1
+if [ "$HAS_DOCKER" -eq 1 ]; then
+  docker ps -q | xargs -r docker stop 2>&1 | sed "s/^/$(date): /"
+  CONTAINERS_STOPPED=1
+fi
 sync; sleep ${c.settleTime||3}; sync
 sudo umount -lf /tmp/img-backup-mnt 2>/dev/null || true
 sudo rm -rf /tmp/img-backup-mnt
