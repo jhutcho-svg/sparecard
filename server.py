@@ -840,7 +840,9 @@ def _iscsi_devices_by_iqn():
     for line in out.splitlines():
         s = line.strip()
         if s.startswith("Target:"):
-            current_iqn = s.split("Target:", 1)[-1].strip()
+            # Line looks like "Target: iqn.… (non-flash)" — keep only the IQN
+            parts = s.split("Target:", 1)[-1].split()
+            current_iqn = parts[0] if parts else None
         elif "Attached scsi disk" in s and current_iqn:
             parts = s.split()
             try:
