@@ -298,12 +298,28 @@ else
     warn "The web UI runs as a service with no terminal, so every privileged"
     warn "action (iSCSI, mounting, fstab, the backup itself) will fail with:"
     warn "    sudo: a terminal is required to read the password"
-    warn ""
-    warn "Fix it by granting passwordless sudo (the Raspberry Pi OS default):"
-    warn "    echo \"$USER ALL=(ALL) NOPASSWD: ALL\" | sudo tee $NOPASSWD_FILE"
-    warn "    sudo chmod 440 $NOPASSWD_FILE"
-    warn "    sudo visudo -cf $NOPASSWD_FILE   # must print: parsed OK"
     warn "──────────────────────────────────────────────────────────────────────"
+    FIXED=""
+    if [[ -t 0 ]]; then
+        read -r -p "Grant $USER passwordless sudo now (writes $NOPASSWD_FILE)? [y/N] " REPLY
+        if [[ "$REPLY" =~ ^[Yy] ]]; then
+            echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo tee "$NOPASSWD_FILE" > /dev/null
+            sudo chmod 440 "$NOPASSWD_FILE"
+            if sudo visudo -cf "$NOPASSWD_FILE" >/dev/null 2>&1; then
+                info "Passwordless sudo granted via $NOPASSWD_FILE."
+                FIXED=1
+            else
+                sudo rm -f "$NOPASSWD_FILE"
+                warn "Sudoers validation failed — entry removed."
+            fi
+        fi
+    fi
+    if [[ -z "$FIXED" ]]; then
+        warn "Fix it manually with:"
+        warn "    echo \"$USER ALL=(ALL) NOPASSWD: ALL\" | sudo tee $NOPASSWD_FILE"
+        warn "    sudo chmod 440 $NOPASSWD_FILE"
+        warn "    sudo visudo -cf $NOPASSWD_FILE   # must print: parsed OK"
+    fi
 fi
 
 # ── Done ───────────────────────────────────────────────────────────────────────
