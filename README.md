@@ -41,7 +41,12 @@ You configure your backup destination, schedule, and notification settings throu
 - Raspberry Pi running Raspberry Pi OS (64-bit recommended)
 - Python 3.9+
 - Flask (`sudo apt install python3-flask`)
-- `sudo` access for the running user
+- **Passwordless** sudo for the running user (the Raspberry Pi OS default for the first user). The app runs as a systemd service with no terminal, so sudo can never prompt — without a `NOPASSWD: ALL` rule, every privileged action (iSCSI, mounting, the backup itself) fails. If your user needs a password for sudo, grant it with:
+  ```
+  echo "$USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/010_$USER-nopasswd
+  sudo chmod 440 /etc/sudoers.d/010_$USER-nopasswd
+  ```
+  The installer checks this and warns if it's missing.
 - [RonR image-backup tools](https://github.com/seamusdemora/RonR-RPi-image-utils) — installable via the GUI
 - **Optional:** `zerofree` (`sudo apt install zerofree`) — for fast Compact Image; falls back to slower dd method without it
 - **Optional:** Runtipi, SMB/NFS/iSCSI target, [ntfy.sh](https://ntfy.sh) account

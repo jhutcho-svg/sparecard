@@ -283,6 +283,29 @@ sudo systemctl daemon-reload
 sudo systemctl enable "$SERVICE_NAME"
 sudo systemctl restart "$SERVICE_NAME"
 
+# ── Check passwordless sudo (required by the web UI at runtime) ───────────────
+# The service runs with no terminal, so sudo can never prompt for a password.
+# Drop the credentials cached by this script's own sudo calls first, otherwise
+# the check passes here but fails for the service once the cache expires.
+step "Checking passwordless sudo…"
+sudo -K
+if sudo -n true 2>/dev/null; then
+    info "Passwordless sudo OK."
+else
+    NOPASSWD_FILE="/etc/sudoers.d/010_${USER}-nopasswd"
+    warn "──────────────────────────────────────────────────────────────────────"
+    warn "User '$USER' does NOT have passwordless sudo."
+    warn "The web UI runs as a service with no terminal, so every privileged"
+    warn "action (iSCSI, mounting, fstab, the backup itself) will fail with:"
+    warn "    sudo: a terminal is required to read the password"
+    warn ""
+    warn "Fix it by granting passwordless sudo (the Raspberry Pi OS default):"
+    warn "    echo \"$USER ALL=(ALL) NOPASSWD: ALL\" | sudo tee $NOPASSWD_FILE"
+    warn "    sudo chmod 440 $NOPASSWD_FILE"
+    warn "    sudo visudo -cf $NOPASSWD_FILE   # must print: parsed OK"
+    warn "──────────────────────────────────────────────────────────────────────"
+fi
+
 # ── Done ───────────────────────────────────────────────────────────────────────
 sleep 3
 STATUS=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)
