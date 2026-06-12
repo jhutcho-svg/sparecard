@@ -5,7 +5,7 @@ Run with: python3 pi_backup_manager.py
 Then open: http://<pi-ip>:7823
 """
 
-import base64, hashlib, json, logging, os, re, secrets, shlex, shutil, subprocess, tempfile, threading, time, queue, calendar
+import base64, hashlib, json, logging, os, re, secrets, shlex, shutil, socket, subprocess, tempfile, threading, time, queue, calendar
 import urllib.error, urllib.request
 from datetime import datetime
 from glob import glob
@@ -1172,6 +1172,72 @@ def api_smb_credentials():
     return jsonify({"ok": True})
 
 # ─────────────────────────────────────────────────────────────────────────────
+# API — Image ownership marker
+# ─────────────────────────────────────────────────────────────────────────────
+# A sidecar file <image>.sparecard.json records which host wrote the image.
+# Backups refuse to touch an existing image without this Pi's marker, so a
+# pre-existing image at a destination is never silently overwritten. The
+# generated backup script enforces the same rule (and updates the marker).
+
+def _image_marker_path(image_path):
+    return Path(str(image_path) + ".sparecard.json")
+
+def _ownership_args():
+    """Resolve mount point + image name from request args/body, falling back
+    to the saved config."""
+    cfg = json.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+    src = request.args if request.method == "GET" else (_body() or {})
+    mp  = (src.get("path") or cfg.get("mountPoint", "/mnt/backups")).strip()
+    img = (src.get("image") or cfg.get("imageName", "pi_backup.img")).strip()
+    if not mp.startswith("/") or "/" in img or ".." in img or not img:
+        return None, None
+    return mp, img
+
+@app.route("/api/image/ownership")
+def api_image_ownership():
+    mp, img = _ownership_args()
+    if not mp:
+        return jsonify({"error": "Invalid path or image name"}), 400
+    image  = Path(mp) / img
+    info   = {"path": str(image), "imageExists": image.exists(), "sizeH": "",
+              "mtime": 0, "markerExists": False, "markerHost": "",
+              "ours": False, "host": socket.gethostname()}
+    if info["imageExists"]:
+        try:
+            st = image.stat()
+            info["sizeH"]  = _human_size(st.st_size)
+            info["mtime"]  = int(st.st_mtime)
+        except Exception:
+            pass
+        marker = _image_marker_path(image)
+        if marker.exists():
+            info["markerExists"] = True
+            try:
+                info["markerHost"] = json.loads(marker.read_text()).get("hostname", "")
+            except Exception:
+                pass
+            info["ours"] = bool(info["markerHost"]) and info["markerHost"] == info["host"]
+    return jsonify(info)
+
+@app.route("/api/image/adopt", methods=["POST"])
+def api_image_adopt():
+    """Mark an existing image as owned by this host, so backups may update it."""
+    mp, img = _ownership_args()
+    if not mp:
+        return jsonify({"error": "Invalid path or image name"}), 400
+    image = Path(mp) / img
+    if not image.exists():
+        return jsonify({"error": f"{image} not found"}), 404
+    content = json.dumps({"hostname": socket.gethostname(),
+                          "adopted": int(time.time())}) + "\n"
+    # sudo tee — the mounted destination is usually root-owned
+    result = subprocess.run(["sudo", "tee", str(_image_marker_path(image))],
+                            input=content, text=True, capture_output=True)
+    if result.returncode != 0:
+        return jsonify({"ok": False, "error": result.stderr}), 500
+    return jsonify({"ok": True})
+
+# ─────────────────────────────────────────────────────────────────────────────
 # API — Manual backup run (SSE stream)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1700,7 +1766,10 @@ def api_cleanup():
         if not imgs:
             results["image"] = "not found"
         else:
-            _, _, rc = sudo_run(["rm", "-f", *[str(p) for p in imgs]], timeout=30)
+            # Remove ownership markers with their images, so a future foreign
+            # image at the same path isn't silently trusted
+            doomed = imgs + [m for p in imgs if (m := _image_marker_path(p)).exists()]
+            _, _, rc = sudo_run(["rm", "-f", *[str(p) for p in doomed]], timeout=30)
             results["image"] = f"deleted {len(imgs)} file(s)" if rc == 0 else "error"
     return jsonify({"ok": True, "results": results})
 
@@ -2502,6 +2571,7 @@ textarea{resize:vertical;line-height:1.6}
           <div class="field" style="margin:0"><div class="lbl">Mount Point</div><input type="text" id="iscsiMountPoint" value="/mnt/backups" oninput="syncMountPoints(this)"></div>
         </div>
         <div id="iscsi-mount-banner" style="display:none;margin-bottom:10px"></div>
+        <div id="iscsi-image-banner" style="display:none;margin-bottom:10px"></div>
         <div id="iscsi-session-banner" style="display:none;margin-bottom:10px"></div>
         <div class="row">
           <button class="btn success" id="iscsi-mnt-btn" onclick="doMount('iscsi')"><span id="iscsi-mnt-sp" class="spinner" style="display:none"></span>⬆ Mount</button>
@@ -2546,6 +2616,7 @@ textarea{resize:vertical;line-height:1.6}
           <div class="field" style="margin:0"><div class="lbl">Extra Options</div><input type="text" id="smbExtraOpts" placeholder="uid=1000,gid=1000"></div>
         </div>
         <div id="smb-mount-banner" style="display:none;margin-bottom:10px"></div>
+        <div id="smb-image-banner" style="display:none;margin-bottom:10px"></div>
         <div class="row">
           <button class="btn success" id="smb-mnt-btn" onclick="doMount('smb')"><span id="smb-mnt-sp" class="spinner" style="display:none"></span>⬆ Mount</button>
           <div class="row" style="gap:7px;margin-left:4px">
@@ -2588,6 +2659,7 @@ textarea{resize:vertical;line-height:1.6}
           <div class="field" style="margin:0"><div class="lbl">Custom Options</div><input type="text" id="nfsCustomOpts" placeholder="timeo=14,retrans=2"></div>
         </div>
         <div id="nfs-mount-banner" style="display:none;margin-bottom:10px"></div>
+        <div id="nfs-image-banner" style="display:none;margin-bottom:10px"></div>
         <div class="row">
           <button class="btn success" id="nfs-mnt-btn" onclick="doMount('nfs')"><span id="nfs-mnt-sp" class="spinner" style="display:none"></span>⬆ Mount</button>
           <div class="row" style="gap:7px;margin-left:4px">
@@ -2627,6 +2699,7 @@ textarea{resize:vertical;line-height:1.6}
           <div class="field" style="margin:0"><div class="lbl">Mount Point</div><input type="text" id="usbMountPoint" value="/mnt/backups" oninput="syncMountPoints(this)"></div>
         </div>
         <div id="usb-mount-banner" style="display:none;margin-bottom:10px"></div>
+        <div id="usb-image-banner" style="display:none;margin-bottom:10px"></div>
         <div class="row">
           <button class="btn success" id="usb-mnt-btn" onclick="doMount('usb')"><span id="usb-mnt-sp" class="spinner" style="display:none"></span>⬆ Mount</button>
           <div class="row" style="gap:7px;margin-left:4px">
@@ -3561,6 +3634,7 @@ async function doMount(dest) {
       if (d.df) appendLog(logId, d.df, "info");
       S.mountStates[dest] = true;
       setMountPill(`${dest}-mnt-pill`, `${dest}-mnt-btn`, true);
+      checkImageOwnership(dest);
     } catch(e) { appendLog(logId, e.message, "err"); }
   }
   spin(`${dest}-mnt-sp`, false);
@@ -3616,6 +3690,35 @@ async function checkFstab(dest) {
   } catch(e) {}
 }
 
+// ─── Image ownership (never silently overwrite a foreign image) ──────────────
+async function checkImageOwnership(dest) {
+  const banner = document.getElementById(`${dest}-image-banner`);
+  if (!banner) return;
+  banner.style.display = "none";
+  try {
+    const r = await fetch(`/api/image/ownership?path=${encodeURIComponent(getMountPoint())}&image=${encodeURIComponent(getImageName())}`);
+    const d = await r.json();
+    if (!d.imageExists || d.ours) return;
+    const when = d.mtime ? new Date(d.mtime * 1000).toLocaleString() : "unknown";
+    const who  = d.markerExists ? `last written by <strong>${esc(d.markerHost)}</strong>` : "of unknown origin (no SpareCard marker)";
+    banner.innerHTML = `<div class="info orange">⚠️ <strong>${esc(getImageName())}</strong> already exists at this destination (${esc(d.sizeH)}, modified ${esc(when)}) — ${who}.<br>
+      Backups update the image in place and will refuse to run until this is resolved. If this file is another Pi's backup, change the Image Name in Settings before backing up here.<br>
+      <button class="btn sm secondary" style="margin-top:8px" onclick="adoptImage('${dest}')">✓ It's this Pi's image — adopt it</button></div>`;
+    banner.style.display = "";
+  } catch(e) {}
+}
+
+async function adoptImage(dest) {
+  try {
+    const r = await fetch("/api/image/adopt", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ path: getMountPoint(), image: getImageName() }) });
+    const d = await r.json();
+    if (!d.ok) throw new Error(d.error || "Adopt failed");
+    toast("Image adopted — backups will update it in place", "ok");
+    checkImageOwnership(dest);
+  } catch(e) { toast(e.message, "err"); }
+}
+
 // ─── Mount detection ──────────────────────────────────────────────────────────
 const DEST_FSTYPE = { smb:"cifs", nfs:"nfs", iscsi:"_netdev_check", usb:"block" };
 
@@ -3624,6 +3727,8 @@ async function checkMountStatus(dest) {
   if (!mp || dest === "local") return;
   const banner = document.getElementById(`${dest}-mount-banner`);
   if (banner) banner.style.display = "none";
+  const imgBanner = document.getElementById(`${dest}-image-banner`);
+  if (imgBanner) imgBanner.style.display = "none";
 
   try {
     const r = await fetch(`/api/mount/status?path=${encodeURIComponent(mp)}`);
@@ -3642,6 +3747,7 @@ async function checkMountStatus(dest) {
     // Update the mount pill to green
     setMountPill(`${dest}-mnt-pill`, `${dest}-mnt-btn`, true);
     S.mountStates[dest] = true;
+    checkImageOwnership(dest);
 
     if (matches && banner) {
       const src = d.source ? ` <span style="color:var(--muted)">(${esc(d.source)})</span>` : "";
@@ -4297,7 +4403,7 @@ if ! mountpoint -q "${smp}"; then
   ${smountCmd} || { echo "$(date): WARNING - Could not mount secondary ${dt.toUpperCase()}, skipping."; }
 fi
 if mountpoint -q "${smp}"; then
-  rsync -av --progress "$IMAGE_PATH" "${smp}/" 2>&1 | sed "s/^/$(date): /"
+  rsync -av --progress "$IMAGE_PATH" "$MARKER" "${smp}/" 2>&1 | sed "s/^/$(date): /"
   [ $? -eq 0 ] && echo "$(date): Secondary ${dt.toUpperCase()} sync complete." || echo "$(date): WARNING - rsync to ${dt.toUpperCase()} failed — primary backup is intact."
   ${sunmountCmd} || true
 fi`;
@@ -4576,6 +4682,17 @@ if [ -f "$SENTINEL" ] && [ ! -f "$IMAGE_PATH" ]; then
   rm -f "$SENTINEL"
 fi
 
+# Ownership guard: never touch an existing image this host didn't write.
+# The marker is written after every successful backup; adopt a pre-existing
+# image from the SpareCard Destination tab (or change the image name).
+MARKER="$IMAGE_PATH.sparecard.json"
+if [ -f "$IMAGE_PATH" ]; then
+  if [ ! -f "$MARKER" ] || ! grep -qF "\\"hostname\\": \\"$(hostname)\\"" "$MARKER"; then
+    OWNER=$(grep -o '"hostname": "[^"]*"' "$MARKER" 2>/dev/null | cut -d'"' -f4)
+    fail_exit "$IMAGE_PATH already exists but is not marked as this host's backup (owner: \${OWNER:-unknown}). Refusing to overwrite — adopt it from the SpareCard Destination tab, or change the image name. No containers were stopped."
+  fi
+fi
+
 # Auto-resize check — BEFORE stopping any containers
 # If the image is too small it will be grown here; if resize fails we abort cleanly
 if [ -f "$SENTINEL" ] && [ -f "$IMAGE_PATH" ]; then
@@ -4623,6 +4740,11 @@ if [ "$BACKUP_EXIT" -ne 0 ]; then
     restart_containers || true
     flock -u 9; exit "$BACKUP_EXIT"
 fi
+
+# Record ownership so future runs (and other Pis) know this image is ours
+printf '{"hostname": "%s", "lastBackup": %s}\\n' "$(hostname)" "$(date +%s)" | sudo tee "$MARKER" > /dev/null \\
+  && echo "$(date): Ownership marker updated." \\
+  || echo "$(date): WARNING - could not write ownership marker ($MARKER)."
 ${secondarySync}
 # ── Step 6: Restart ───────────────────────────────────────────────────────────
 echo "$(date): BACKUP SUCCESSFUL — restarting..."
@@ -4728,6 +4850,17 @@ let _runElapsedTimer = null;
 
 async function startBackup() {
   document.getElementById("confirm-panel").style.display = "none";
+  // Ownership pre-flight: the script refuses foreign images, so resolve it here
+  // with an explicit adopt instead of a mid-run failure
+  try {
+    const own = await (await fetch("/api/image/ownership")).json();
+    if (own.imageExists && !own.ours) {
+      const who = own.markerExists ? `was last written by '${own.markerHost}'` : "has no SpareCard ownership marker";
+      if (!confirm(`${own.path} already exists and ${who}.\n\nThe backup updates this file in place, overwriting its contents. Adopt it as this Pi's image and continue?`)) return;
+      const ad = await (await fetch("/api/image/adopt", { method:"POST", headers:{"Content-Type":"application/json"}, body:"{}" })).json();
+      if (!ad.ok) { toast(ad.error || "Adopt failed", "err"); return; }
+    }
+  } catch(e) {}
   S.backupRunning = true;
   S.runPhase = -1;
   document.getElementById("run-log").innerHTML = "";

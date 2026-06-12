@@ -26,6 +26,7 @@ You configure your backup destination, schedule, and notification settings throu
 - Runtipi API fallback: restarts app containers that need network recreation
 - Guided image-backup install from GitHub (no manual steps)
 - Restore tab with USB/SD safety checks
+- Ownership guard: a `<image>.sparecard.json` marker records which Pi wrote the image — backups refuse to overwrite a pre-existing or foreign image until you adopt it (one click) or change the image name
 - Visual cron scheduler
 - ntfy.sh push notifications (start, success, failure)
 - fstab mount-on-boot toggles
