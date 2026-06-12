@@ -475,6 +475,8 @@ def run(argv, timeout=30, merge=False):
         )
     except FileNotFoundError:
         return "", f"{argv[0]}: command not found", 127
+    except subprocess.TimeoutExpired:
+        return "", f"{argv[0]}: timed out after {timeout}s", 124
     out = (r.stdout or "").strip()
     err = "" if merge else (r.stderr or "").strip()
     return out, err, r.returncode
