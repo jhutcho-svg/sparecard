@@ -165,6 +165,40 @@ All notable changes are documented here. This is the single source of truth for 
 
 ---
 
+### 2026-06-12
+
+#### Added
+- **Image ownership guard** — a sidecar `<image>.sparecard.json` marker records which host wrote the image. The generated backup script refuses to touch an existing image without this host's marker (it aborts *before* stopping any containers, with an ntfy failure notification) and updates the marker after every successful run; secondary rsync destinations receive the marker alongside the image. The Destination tab warns when a mounted destination already holds a foreign or unmarked image (size, mtime, owner) with a one-click **Adopt** button, and the manual Run Backup flow confirms + adopts up front. Reset & Cleanup deletes markers together with images. Prevents a pre-existing `pi_backup.img` from another Pi (or an older setup) being silently overwritten by a name collision.
+- **Installer passwordless-sudo check** — the service runs with no terminal, so sudo can never prompt; the app has always required `NOPASSWD` sudo for everything beyond the package-manager sudoers entry, but nothing checked or documented it. `install.sh` now drops cached credentials (`sudo -K`) and tests `sudo -n true` at the end of each run; on failure it explains the error users would otherwise hit ("a terminal is required to read the password") and offers to write the standard `010_<user>-nopasswd` rule (visudo-validated, removed if invalid). The README Requirements section now states the requirement explicitly.
+
+#### Fixed
+- **iSCSI block device auto-detect** — `iscsiadm -m session -P 3` prints `Target: <iqn> (non-flash)` on modern open-iscsi, so the IQN→device map was keyed with the suffix attached and lookups by bare IQN never matched. Login auto-detect and the sessions list device column always came back empty; both now work.
+- **Stalled commands returned an HTML 500** — `subprocess.TimeoutExpired` was uncaught in `run()`, so a hung command crashed the request handler and the browser got Flask's HTML error page (surfacing as "unexpected token '<' … is not valid JSON"). Timeouts now return rc 124 with a clear message.
+
+#### Changed
+- **Rebrand internals (easy half)** — systemd unit, install dir, and sudoers file renamed to `sparecard` (`sparecard.service`, `~/sparecard`, `/etc/sudoers.d/sparecard`). Re-running `install.sh` on an existing install migrates automatically: the old `pi-backup-manager` unit is stopped and removed along with its sudoers entry. Config/auth paths, `PBM_*` env vars, the `~/.pbm` log dir, and the `X-PBM-CSRF` header deliberately keep their old names — renaming them would need permanent compatibility shims for no user-visible gain.
+
+---
+
+### 2026-06-11
+
+#### Changed
+- **Renamed to SpareCard** (formerly Pi Backup Manager) — all visible branding: page titles, headers, auth realm, README, installer text, service description, cron marker.
+- 2 MB request body cap (JSON 413); `_body()` helper gives clean JSON 400s at all `get_json` sites; `/api/config` enforces a key allowlist with a version stamp.
+- Image stats via `st_blocks` replace `du` forks; `shutil.disk_usage` replaces `df`; `/api/dashboard` served from a 3 s TTL cache.
+- Delegated `[data-action]` click handling replaces inline `onclick` in re-rendered rows; memoised element lookups remove per-log-line `getElementById` churn.
+
+#### Added
+- **Restore fit check** — the boot disk is shown locked ("Boot disk — protected"); a size summary with fit check runs before writing, and both client and server refuse images larger than the target device.
+- **Per-run job logs** — every backup/verify/compact/restore run is teed to `~/.pbm/<job>-<timestamp>.log` (`PBM_LOG_DIR`, last 10 kept).
+- **Responsive layout** down to ~380 px wide; aria-labels on icon-only buttons; status badges use shape glyphs, not colour alone.
+
+#### Fixed
+- **Multi-tab live logs** — a shared `Job` class with per-client queues replaces six duplicated SSE stacks; a second browser tab now replays history and streams correctly instead of stealing the stream.
+- Dashboard auto-refreshes (3 s) only while a backup is running; terminal log boxes are capped at 1000 DOM nodes.
+
+---
+
 ### 2026-06-10
 
 #### Security
